@@ -1,203 +1,156 @@
-using System;
-using System.Text.Json.Nodes;
-using System.Net.Http.Json;
+using System.Net.Http.Headers;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
-namespace MatrixIndexer;
+namespace DiscordIndexer;
 
 public class Program
 {
     private static readonly HttpClient Http = new();
-    private static IMongoCollection<BsonDocument>? _eventsCollection;
-    private static IMongoCollection<BsonDocument>? _backfillCollection;
 
-    private static string? _syncToken;
-    private static string _stateFile = "sync_token.txt";
+    private static IMongoCollection<BsonDocument>? _messages;
+    private static IMongoCollection<BsonDocument>? _backfill;
 
-    // Backfill behavior
-    private static int _backfillPageSize = 200;
+    private static int _backfillPageSize = 100; // Discord max
     private static int _backfillWorkers = 2;
 
     public static async Task Main(string[] args)
     {
-        Console.WriteLine("Starting Matrix Indexer (.NET)");
+        Console.WriteLine("Starting Discord Indexer (.NET)");
 
-        // 1. Config
-        var homeserver = GetEnv("MATRIX_HOMESERVER");
-        var userId = GetEnv("MATRIX_USER_ID");
-        var password = GetEnv("MATRIX_PASSWORD");
+        var token = GetEnv("DISCORD_BOT_TOKEN");
+        var apiBase = GetEnv("DISCORD_API_BASE", "https://discord.com/api/v10").TrimEnd(/);
+        var gatewayUrl = GetEnv("DISCORD_GATEWAY_URL", "wss://gateway.discord.gg/?v=10&encoding=json");
+        var guildIdsCsv = GetEnv("DISCORD_GUILD_IDS", "");
+        var intents = int.Parse(GetEnv("DISCORD_INTENTS", "513")); // GUILDS + GUILD_MESSAGES
+
         var mongoUri = GetEnv("MONGODB_URI", "mongodb://localhost:27017");
-        var mongoDbName = GetEnv("MONGODB_DB", "matrix_index");
+        var mongoDbName = GetEnv("MONGODB_DB", "discord_index");
 
-        _stateFile = GetEnv("INDEXER_SYNC_TOKEN_PATH", _stateFile);
         _backfillPageSize = int.Parse(GetEnv("INDEXER_BACKFILL_PAGE_SIZE", _backfillPageSize.ToString()));
         _backfillWorkers = int.Parse(GetEnv("INDEXER_BACKFILL_WORKERS", _backfillWorkers.ToString()));
 
-        // 2. Mongo
-        Console.WriteLine($"Connecting to MongoDB: {mongoUri}");
-        var mongoClient = new MongoClient(mongoUri);
-        var db = mongoClient.GetDatabase(mongoDbName);
-        _eventsCollection = db.GetCollection<BsonDocument>("events");
-        _backfillCollection = db.GetCollection<BsonDocument>("room_backfill");
+        if (_backfillPageSize is < 1 or > 100) _backfillPageSize = 100;
 
-        // Ensure indexes
+        // Mongo
+        Console.WriteLine($"Connecting to MongoDB: {mongoUri}");
+        var client = new MongoClient(mongoUri);
+        var db = client.GetDatabase(mongoDbName);
+        _messages = db.GetCollection<BsonDocument>("messages");
+        _backfill = db.GetCollection<BsonDocument>("channel_backfill");
         await EnsureIndexes();
         Console.WriteLine("MongoDB indexes ensured.");
 
-        // 3. Matrix Login
-        if (!homeserver.StartsWith("http")) homeserver = "https://" + homeserver;
-        homeserver = homeserver.TrimEnd('/');
+        // HTTP auth
+        Http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bot", token);
 
-        Console.WriteLine($"Logging into Matrix: {homeserver} as {userId}");
+        // Seed channels for backfill
+        var guildIds = guildIdsCsv
+            .Split(,, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Distinct()
+            .ToArray();
 
-        string accessToken;
-        try
+        if (guildIds.Length == 0)
         {
-            var loginData = new
+            Console.WriteLine("WARN: DISCORD_GUILD_IDS not set; cannot enumerate channels for backfill.");
+            Console.WriteLine("Set DISCORD_GUILD_IDS=comma,separated,guildIds to enable history backfill.");
+        }
+        else
+        {
+            foreach (var gid in guildIds)
             {
-                type = "m.login.password",
-                user = userId,
-                password = password
-            };
+                await SeedGuildChannels(apiBase, gid);
+            }
 
-            var loginResp = await Http.PostAsJsonAsync($"{homeserver}/_matrix/client/r0/login", loginData);
-            loginResp.EnsureSuccessStatusCode();
-
-            var loginJson = await loginResp.Content.ReadFromJsonAsync<JsonNode>();
-            accessToken = loginJson?["access_token"]?.ToString() ?? throw new Exception("No access token");
-            Console.WriteLine("Login successful.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Login failed: {ex.Message}");
-            return;
+            Console.WriteLine($"Starting backfill workers: {_backfillWorkers} (pageSize={_backfillPageSize})");
+            for (var i = 0; i < _backfillWorkers; i++)
+            {
+                _ = Task.Run(() => BackfillWorkerLoop(apiBase));
+            }
         }
 
-        // 4. Load state
-        if (File.Exists(_stateFile))
-        {
-            _syncToken = (await File.ReadAllTextAsync(_stateFile)).Trim();
-            if (!string.IsNullOrEmpty(_syncToken))
-                Console.WriteLine($"Loaded sync token: {_syncToken}");
-        }
-
-        // 5. Start live sync loop; after first successful sync start background backfill workers
-        Http.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
-
-        var backfillStarted = false;
-
-        Console.WriteLine("Starting sync loop...");
+        // Live gateway ingestion
+        Console.WriteLine("Starting Discord gateway live ingestion...");
         while (true)
         {
             try
             {
-                var url = $"{homeserver}/_matrix/client/r0/sync?timeout=30000";
-                if (!string.IsNullOrEmpty(_syncToken)) url += $"&since={_syncToken}";
-
-                var syncResp = await Http.GetAsync(url);
-                if (!syncResp.IsSuccessStatusCode)
-                {
-                    Console.WriteLine($"Sync failed: {syncResp.StatusCode}");
-                    await Task.Delay(5000);
-                    continue;
-                }
-
-                var root = await syncResp.Content.ReadFromJsonAsync<JsonNode>();
-                if (root == null) continue;
-
-                // Process rooms first; only persist next_batch after successful processing
-                await ProcessSyncRoomsAndSeedBackfill(root);
-
-                // Update token after processing
-                var nextBatch = root["next_batch"]?.ToString();
-                if (!string.IsNullOrEmpty(nextBatch))
-                {
-                    _syncToken = nextBatch;
-                    await AtomicWriteAsync(_stateFile, _syncToken);
-                }
-
-                if (!backfillStarted)
-                {
-                    backfillStarted = true;
-                    Console.WriteLine($"First successful sync complete. Starting backfill workers: {_backfillWorkers} (pageSize={_backfillPageSize})");
-                    for (var i = 0; i < _backfillWorkers; i++)
-                    {
-                        _ = Task.Run(() => BackfillWorkerLoop(homeserver));
-                    }
-                }
+                await RunGatewayLoop(gatewayUrl, token, intents);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in sync loop: {ex.Message}");
-                await Task.Delay(5000);
+                Console.WriteLine($"Gateway loop error: {ex.Message}");
             }
+
+            await Task.Delay(5000);
         }
     }
 
     private static async Task EnsureIndexes()
     {
-        if (_eventsCollection == null || _backfillCollection == null) return;
+        if (_messages == null || _backfill == null) return;
 
-        // Events: unique by event_id (idempotent upsert)
-        var evKeys = Builders<BsonDocument>.IndexKeys.Ascending("event_id");
-        var evOptions = new CreateIndexOptions { Unique = true };
-        await _eventsCollection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(evKeys, evOptions));
+        await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("message_id"),
+            new CreateIndexOptions { Unique = true }));
 
-        // Backfill state: unique by room_id
-        var bfKeys = Builders<BsonDocument>.IndexKeys.Ascending("room_id");
-        var bfOptions = new CreateIndexOptions { Unique = true };
-        await _backfillCollection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(bfKeys, bfOptions));
+        await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("channel_id").Descending("timestamp_ms")));
 
-        // Helpful query index
-        var bfQueryKeys = Builders<BsonDocument>.IndexKeys.Ascending("done").Ascending("updated_at");
-        await _backfillCollection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(bfQueryKeys));
+        await _backfill.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("channel_id"),
+            new CreateIndexOptions { Unique = true }));
+
+        await _backfill.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("done").Ascending("updated_at")));
     }
 
-    private static async Task ProcessSyncRoomsAndSeedBackfill(JsonNode root)
+    private static async Task SeedGuildChannels(string apiBase, string guildId)
     {
-        // Debug: print the structure of the sync response
-        Console.WriteLine("DEBUG: Sync response root keys: " + string.Join(", ", root.AsObject().Select(x => x.Key)));
-        var roomsNode = root["rooms"];
-        Console.WriteLine("DEBUG: rooms node is null: " + (roomsNode == null));
-        if (roomsNode != null)
+        if (_backfill == null) return;
+
+        Console.WriteLine($"Fetching channels for guild {guildId}...");
+        var url = $"{apiBase}/guilds/{guildId}/channels";
+        var resp = await Http.GetAsync(url);
+        if (!resp.IsSuccessStatusCode)
         {
-            Console.WriteLine("DEBUG: rooms keys: " + string.Join(", ", roomsNode.AsObject().Select(x => x.Key)));
+            Console.WriteLine($"WARN: Failed to list channels for guild {guildId}: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+            return;
         }
-        var join = root["rooms"]?["join"]?.AsObject();
-        if (join == null) return;
 
-        foreach (var room in join)
+        var json = await resp.Content.ReadAsStringAsync();
+        var arr = JsonDocument.Parse(json).RootElement;
+        if (arr.ValueKind != JsonValueKind.Array) return;
+
+        foreach (var ch in arr.EnumerateArray())
         {
-            var roomId = room.Key;
-            var timeline = room.Value?["timeline"];
-            var events = timeline?["events"]?.AsArray();
-            if (events != null)
-            {
-                await ProcessEvents(roomId, events);
-            }
+            var type = ch.GetProperty("type").GetInt32();
+            // 0 = GUILD_TEXT, 5 = GUILD_ANNOUNCEMENT
+            if (type != 0 && type != 5) continue;
 
-            // Seed backfill cursor from prev_batch token
-            var prevBatch = timeline?["prev_batch"]?.ToString();
-            if (!string.IsNullOrEmpty(prevBatch))
-            {
-                await SeedBackfillRoom(roomId, prevBatch);
-            }
+            var channelId = ch.GetProperty("id").GetString();
+            if (string.IsNullOrEmpty(channelId)) continue;
+
+            await SeedBackfillChannel(channelId!, guildId);
         }
     }
 
-    private static async Task SeedBackfillRoom(string roomId, string cursor)
+    private static async Task SeedBackfillChannel(string channelId, string guildId)
     {
-        if (_backfillCollection == null) return;
+        if (_backfill == null) return;
 
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
-        var existing = await _backfillCollection.Find(filter).FirstOrDefaultAsync();
+        var filter = Builders<BsonDocument>.Filter.Eq("channel_id", channelId);
+        var existing = await _backfill.Find(filter).FirstOrDefaultAsync();
         if (existing != null) return;
 
         var doc = new BsonDocument
         {
-            { "room_id", roomId },
-            { "cursor", cursor },
+            { "channel_id", channelId },
+            { "guild_id", guildId },
+            { "cursor_before", BsonNull.Value },
             { "done", false },
             { "claimed", false },
             { "created_at", DateTime.UtcNow },
@@ -207,8 +160,8 @@ public class Program
 
         try
         {
-            await _backfillCollection.InsertOneAsync(doc);
-            Console.WriteLine($"Seeded backfill cursor for room {roomId}");
+            await _backfill.InsertOneAsync(doc);
+            Console.WriteLine($"Seeded backfill for channel {channelId}");
         }
         catch
         {
@@ -216,87 +169,43 @@ public class Program
         }
     }
 
-    private static async Task BackfillWorkerLoop(string homeserver)
+    private static async Task BackfillWorkerLoop(string apiBase)
     {
-        if (_backfillCollection == null) return;
+        if (_backfill == null) return;
 
         while (true)
         {
             try
             {
-                var room = await ClaimNextBackfillRoom();
-                if (room == null)
+                var claim = await ClaimNextChannel();
+                if (claim == null)
                 {
-                    // No rooms pending; sleep a bit then try again.
-                    await Task.Delay(TimeSpan.FromMinutes(10));
+                    await Task.Delay(2000);
                     continue;
                 }
 
-                var roomId = room["room_id"].AsString;
-                var cursor = room.GetValue("cursor", BsonNull.Value).ToString();
+                var channelId = claim["channel_id"].AsString;
+                var cursor = claim.Contains("cursor_before") && !claim["cursor_before"].IsBsonNull
+                    ? claim["cursor_before"].AsString
+                    : null;
 
-                if (string.IsNullOrEmpty(cursor) || cursor == "BsonNull")
-                {
-                    await MarkBackfillDone(roomId);
-                    continue;
-                }
+                var (newCursor, done, count) = await BackfillOnePage(apiBase, channelId, cursor);
 
-                var url = $"{homeserver}/_matrix/client/r0/rooms/{Uri.EscapeDataString(roomId)}/messages?dir=b&limit={_backfillPageSize}&from={Uri.EscapeDataString(cursor)}";
-                var resp = await Http.GetAsync(url);
+                await UpdateChannelState(channelId, newCursor, done, 0);
 
-                if ((int)resp.StatusCode == 429)
-                {
-                    var retry = resp.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(10);
-                    await Task.Delay(retry);
-                    await UnclaimRoom(roomId);
-                    continue;
-                }
-
-                if (!resp.IsSuccessStatusCode)
-                {
-                    await IncrementBackfillError(roomId, $"HTTP {(int)resp.StatusCode}");
-                    await Task.Delay(TimeSpan.FromSeconds(5));
-                    await UnclaimRoom(roomId);
-                    continue;
-                }
-
-                var json = await resp.Content.ReadFromJsonAsync<JsonNode>();
-                if (json == null)
-                {
-                    await UnclaimRoom(roomId);
-                    continue;
-                }
-
-                var chunk = json["chunk"]?.AsArray();
-                var end = json["end"]?.ToString();
-
-                if (chunk != null && chunk.Count > 0)
-                {
-                    await ProcessEvents(roomId, chunk);
-                }
-
-                if (string.IsNullOrEmpty(end) || chunk == null || chunk.Count == 0)
-                {
-                    await MarkBackfillDone(roomId);
-                }
-                else
-                {
-                    await UpdateBackfillCursor(roomId, end);
-                }
-
-                await Task.Delay(250);
+                await Task.Delay(350);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Backfill worker error: {ex.Message}");
-                await Task.Delay(5000);
+                await Task.Delay(2000);
             }
         }
     }
 
-    private static async Task<BsonDocument?> ClaimNextBackfillRoom()
+    private static async Task<BsonDocument?> ClaimNextChannel()
     {
-        if (_backfillCollection == null) return null;
+        if (_backfill == null) return null;
 
         var filter = Builders<BsonDocument>.Filter.And(
             Builders<BsonDocument>.Filter.Eq("done", false),
@@ -307,111 +216,198 @@ public class Program
             .Set("claimed", true)
             .Set("updated_at", DateTime.UtcNow);
 
-        var opts = new FindOneAndUpdateOptions<BsonDocument>
+        return await _backfill.FindOneAndUpdateAsync(
+            filter,
+            update,
+            new FindOneAndUpdateOptions<BsonDocument>
+            {
+                ReturnDocument = ReturnDocument.After,
+                Sort = Builders<BsonDocument>.Sort.Ascending("updated_at")
+            });
+    }
+
+    private static async Task UpdateChannelState(string channelId, string? newCursor, bool done, int errorDelta)
+    {
+        if (_backfill == null) return;
+
+        var filter = Builders<BsonDocument>.Filter.Eq("channel_id", channelId);
+
+        var upd = Builders<BsonDocument>.Update
+            .Set("cursor_before", newCursor == null ? BsonNull.Value : newCursor)
+            .Set("done", done)
+            .Set("claimed", false)
+            .Set("updated_at", DateTime.UtcNow);
+
+        if (errorDelta > 0)
+            upd = upd.Inc("error_count", errorDelta);
+
+        await _backfill.UpdateOneAsync(filter, upd);
+    }
+
+    private static async Task<(string? newCursor, bool done, int count)> BackfillOnePage(string apiBase, string channelId, string? before)
+    {
+        var url = $"{apiBase}/channels/{channelId}/messages?limit={_backfillPageSize}";
+        if (!string.IsNullOrEmpty(before))
+            url += $"&before={before}";
+
+        var resp = await Http.GetAsync(url);
+        if (!resp.IsSuccessStatusCode)
         {
-            Sort = Builders<BsonDocument>.Sort.Ascending("updated_at"),
-            ReturnDocument = ReturnDocument.After
+            Console.WriteLine($"WARN: Backfill fetch failed for channel {channelId}: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+            return (before, false, 0);
+        }
+
+        var json = await resp.Content.ReadAsStringAsync();
+        var root = JsonDocument.Parse(json).RootElement;
+        if (root.ValueKind != JsonValueKind.Array)
+            return (before, false, 0);
+
+        var msgs = root.EnumerateArray().ToList();
+        if (msgs.Count == 0)
+        {
+            Console.WriteLine($"Backfill done for channel {channelId}");
+            return (before, true, 0);
+        }
+
+        var oldest = msgs.Last().GetProperty("id").GetString();
+
+        foreach (var m in msgs)
+        {
+            await InsertMessage(m, source: "backfill");
+        }
+
+        Console.WriteLine($"Backfilled {msgs.Count} messages from channel {channelId}");
+        return (oldest, false, msgs.Count);
+    }
+
+    private static async Task InsertMessage(JsonElement msg, string source)
+    {
+        if (_messages == null) return;
+
+        var id = msg.GetProperty("id").GetString() ?? "";
+        var channelId = msg.TryGetProperty("channel_id", out var cid) ? cid.GetString() : null;
+        var timestamp = msg.TryGetProperty("timestamp", out var ts) ? ts.GetString() : null;
+        var guildId = msg.TryGetProperty("guild_id", out var gid) ? gid.GetString() : null;
+
+        long tsMs = 0;
+        if (!string.IsNullOrEmpty(timestamp) && DateTimeOffset.TryParse(timestamp, out var dto))
+            tsMs = dto.ToUnixTimeMilliseconds();
+
+        var doc = new BsonDocument
+        {
+            { "message_id", id },
+            { "channel_id", channelId ?? BsonNull.Value },
+            { "guild_id", guildId ?? BsonNull.Value },
+            { "timestamp", timestamp ?? BsonNull.Value },
+            { "timestamp_ms", tsMs },
+            { "source", source },
+            { "raw", BsonDocument.Parse(msg.GetRawText()) },
+            { "ingested_at", DateTime.UtcNow },
         };
 
-        return await _backfillCollection.FindOneAndUpdateAsync(filter, update, opts);
-    }
-
-    private static async Task UnclaimRoom(string roomId)
-    {
-        if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
-        var update = Builders<BsonDocument>.Update
-            .Set("claimed", false)
-            .Set("updated_at", DateTime.UtcNow);
-        await _backfillCollection.UpdateOneAsync(filter, update);
-    }
-
-    private static async Task UpdateBackfillCursor(string roomId, string cursor)
-    {
-        if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
-        var update = Builders<BsonDocument>.Update
-            .Set("cursor", cursor)
-            .Set("claimed", false)
-            .Set("updated_at", DateTime.UtcNow);
-        await _backfillCollection.UpdateOneAsync(filter, update);
-    }
-
-    private static async Task MarkBackfillDone(string roomId)
-    {
-        if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
-        var update = Builders<BsonDocument>.Update
-            .Set("done", true)
-            .Set("claimed", false)
-            .Set("updated_at", DateTime.UtcNow);
-        await _backfillCollection.UpdateOneAsync(filter, update);
-        Console.WriteLine($"Backfill complete for room {roomId}");
-    }
-
-    private static async Task IncrementBackfillError(string roomId, string reason)
-    {
-        if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
-        var update = Builders<BsonDocument>.Update
-            .Inc("error_count", 1)
-            .Set("last_error", reason)
-            .Set("updated_at", DateTime.UtcNow)
-            .Set("claimed", false);
-        await _backfillCollection.UpdateOneAsync(filter, update);
-        Console.WriteLine($"Backfill error for room {roomId}: {reason}");
-    }
-
-    private static async Task ProcessEvents(string roomId, JsonArray events)
-    {
-        if (_eventsCollection == null) return;
-
-        var docs = new List<BsonDocument>();
-        foreach (var ev in events)
+        try
         {
-            if (ev == null) continue;
-
-            var eventId = ev["event_id"]?.ToString();
-            if (string.IsNullOrEmpty(eventId)) continue;
-
-            var doc = BsonDocument.Parse(ev.ToJsonString());
-            if (!doc.Contains("room_id")) doc["room_id"] = roomId;
-            docs.Add(doc);
+            await _messages.InsertOneAsync(doc);
         }
-
-        if (docs.Count == 0) return;
-
-        foreach (var doc in docs)
+        catch (MongoWriteException mwx) when (mwx.WriteError.Category == ServerErrorCategory.DuplicateKey)
         {
-            try
+            // ignore duplicates
+        }
+    }
+
+    private static async Task RunGatewayLoop(string gatewayUrl, string token, int intents)
+    {
+        using var ws = new ClientWebSocket();
+        await ws.ConnectAsync(new Uri(gatewayUrl), CancellationToken.None);
+
+        using var helloDoc = await ReceiveJson(ws);
+        var interval = helloDoc.RootElement.GetProperty("d").GetProperty("heartbeat_interval").GetInt32();
+
+        int? seq = null;
+
+        using var cts = new CancellationTokenSource();
+
+        var hbTask = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
             {
-                var filter = Builders<BsonDocument>.Filter.Eq("event_id", doc["event_id"]);
-                await _eventsCollection.ReplaceOneAsync(filter, doc, new ReplaceOptions { IsUpsert = true });
+                await Task.Delay(interval);
+                var payload = new { op = 1, d = seq };
+                await SendJson(ws, payload);
             }
-            catch
+        });
+
+        var identify = new
+        {
+            op = 2,
+            d = new
             {
-                // Ignore duplicates or transient errors.
+                token,
+                intents,
+                properties = new { os = "linux", browser = "discord-indexer", device = "discord-indexer" }
+            }
+        };
+        await SendJson(ws, identify);
+
+        while (ws.State == WebSocketState.Open)
+        {
+            using var msg = await ReceiveJson(ws);
+            var root = msg.RootElement;
+
+            if (root.TryGetProperty("s", out var sEl) && sEl.ValueKind != JsonValueKind.Null)
+                seq = sEl.GetInt32();
+
+            var op = root.GetProperty("op").GetInt32();
+            if (op == 0)
+            {
+                var t = root.GetProperty("t").GetString();
+                var d = root.GetProperty("d");
+
+                if (t == "MESSAGE_CREATE")
+                {
+                    await InsertMessage(d, source: "live");
+                }
+            }
+            else if (op == 7 || op == 9)
+            {
+                break;
             }
         }
 
-        Console.WriteLine($"Processed {docs.Count} events from {roomId}");
+        cts.Cancel();
+        try { await hbTask; } catch { /* ignore */ }
+
+        try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
     }
 
-    private static async Task AtomicWriteAsync(string path, string content)
+    private static async Task<JsonDocument> ReceiveJson(ClientWebSocket ws)
     {
-        var tmp = path + ".tmp";
-        await File.WriteAllTextAsync(tmp, content);
-        File.Move(tmp, path, true);
-    }
-
-    private static string GetEnv(string key, string? defaultValue = null)
-    {
-        var val = Environment.GetEnvironmentVariable(key);
-        if (string.IsNullOrEmpty(val))
+        var buffer = new byte[1 << 16];
+        var sb = new StringBuilder();
+        while (true)
         {
-            if (defaultValue != null) return defaultValue;
-            throw new Exception($"Missing environment variable: {key}");
+            var res = await ws.ReceiveAsync(buffer, CancellationToken.None);
+            if (res.MessageType == WebSocketMessageType.Close)
+                throw new Exception("Gateway closed");
+
+            sb.Append(Encoding.UTF8.GetString(buffer, 0, res.Count));
+            if (res.EndOfMessage) break;
         }
-        return val;
+        return JsonDocument.Parse(sb.ToString());
+    }
+
+    private static Task SendJson(ClientWebSocket ws, object payload)
+    {
+        var json = JsonSerializer.Serialize(payload);
+        var bytes = Encoding.UTF8.GetBytes(json);
+        return ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+    }
+
+    private static string GetEnv(string key, string? def = null)
+    {
+        var v = Environment.GetEnvironmentVariable(key);
+        if (!string.IsNullOrEmpty(v)) return v;
+        if (def != null) return def;
+        throw new Exception($"Missing required env var: {key}");
     }
 }
