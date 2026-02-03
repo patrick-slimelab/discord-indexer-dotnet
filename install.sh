@@ -346,6 +346,26 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
   echo "[install] Installing systemd unit (discord-indexer.service)"
 
+  # Big warning for missing Docker (common on WSL2)
+  if ! command -v docker >/dev/null 2>&1; then
+    cat >&2 <<'WARN'
+
+====================  DOCKER REQUIRED  ====================
+This installer is configured to run MongoDB as a Docker container
+via systemd (discord-indexer-mongo.service).
+
+Docker was NOT detected on this machine.
+
+- If you're on WSL2: you likely need Docker Desktop + WSL integration.
+- Otherwise: install Docker Engine for your distro.
+
+Without Docker (or an alternative MongoDB), discord-indexer will fail
+with Mongo connection errors (default MONGODB_URI points to localhost).
+===========================================================
+
+WARN
+  fi
+
   if ! id -u discord-indexer >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin discord-indexer
   fi
