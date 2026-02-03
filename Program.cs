@@ -22,7 +22,7 @@ public class Program
         Console.WriteLine("Starting Discord Indexer (.NET)");
 
         var token = GetEnv("DISCORD_BOT_TOKEN");
-        var apiBase = GetEnv("DISCORD_API_BASE", "https://discord.com/api/v10").TrimEnd(/);
+        var apiBase = GetEnv("DISCORD_API_BASE", "https://discord.com/api/v10").TrimEnd('/');
         var gatewayUrl = GetEnv("DISCORD_GATEWAY_URL", "wss://gateway.discord.gg/?v=10&encoding=json");
         var guildIdsCsv = GetEnv("DISCORD_GUILD_IDS", "");
         var intents = int.Parse(GetEnv("DISCORD_INTENTS", "513")); // GUILDS + GUILD_MESSAGES
@@ -49,16 +49,23 @@ public class Program
 
         // Seed channels for backfill
         var guildIds = guildIdsCsv
-            .Split(,, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
             .Distinct()
             .ToArray();
 
         if (guildIds.Length == 0)
         {
-            Console.WriteLine("WARN: DISCORD_GUILD_IDS not set; cannot enumerate channels for backfill.");
-            Console.WriteLine("Set DISCORD_GUILD_IDS=comma,separated,guildIds to enable history backfill.");
+            Console.WriteLine("DISCORD_GUILD_IDS not set; discovering guilds via Discord API...");
+            guildIds = await ListGuildIds(apiBase);
+
+            if (guildIds.Length == 0)
+            {
+                Console.WriteLine("WARN: No guilds returned from /users/@me/guilds. Backfill disabled.");
+                Console.WriteLine("(Live gateway ingestion will still run.)");
+            }
         }
-        else
+
+        if (guildIds.Length > 0)
         {
             foreach (var gid in guildIds)
             {
@@ -106,6 +113,54 @@ public class Program
 
         await _backfill.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("done").Ascending("updated_at")));
+    }
+
+    private static async Task<string[]> ListGuildIds(string apiBase)
+    {
+        // Uses GET /users/@me/guilds (Bot token)
+        // Docs: https://discord.com/developers/docs/resources/user#get-current-user-guilds
+        // This is paginated. We request up to 200 per page.
+
+        var ids = new List<string>();
+        string? after = null;
+
+        while (true)
+        {
+            var url = $"{apiBase}/users/@me/guilds?limit=200";
+            if (!string.IsNullOrEmpty(after)) url += $"&after={Uri.EscapeDataString(after)}";
+
+            var resp = await Http.GetAsync(url);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"WARN: Failed to list guilds: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+                return ids.ToArray();
+            }
+
+            var json = await resp.Content.ReadAsStringAsync();
+            var arr = JsonDocument.Parse(json).RootElement;
+            if (arr.ValueKind != JsonValueKind.Array) break;
+
+            var page = arr.EnumerateArray().ToArray();
+            if (page.Length == 0) break;
+
+            foreach (var g in page)
+            {
+                var id = g.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                var name = g.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
+
+                if (!string.IsNullOrEmpty(id))
+                {
+                    ids.Add(id);
+                    Console.WriteLine($"Discovered guild: {name ?? "(no-name)"} ({id})");
+                    after = id;
+                }
+            }
+
+            // If the API returns less than limit, we're done.
+            if (page.Length < 200) break;
+        }
+
+        return ids.Distinct().ToArray();
     }
 
     private static async Task SeedGuildChannels(string apiBase, string guildId)
