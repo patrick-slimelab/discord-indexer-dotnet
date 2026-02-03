@@ -27,7 +27,13 @@ public class Program
         var apiBase = GetEnv("DISCORD_API_BASE", "https://discord.com/api/v10").TrimEnd('/');
         var gatewayUrl = GetEnv("DISCORD_GATEWAY_URL", "wss://gateway.discord.gg/?v=10&encoding=json");
         var guildIdsCsv = GetEnv("DISCORD_GUILD_IDS", "");
-        var intents = int.Parse(GetEnv("DISCORD_INTENTS", "513")); // GUILDS + GUILD_MESSAGES
+        // Default intents:
+        // - GUILDS (1)
+        // - GUILD_MESSAGES (512)
+        // - DIRECT_MESSAGES (4096)
+        // NOTE: MESSAGE_CONTENT (32768) is privileged and must be enabled in the Discord Developer Portal.
+        // We do NOT enable it by default.
+        var intents = int.Parse(GetEnv("DISCORD_INTENTS", "4609"));
 
         var mongoUri = GetEnv("MONGODB_URI", "mongodb://localhost:27017");
         var mongoDbName = GetEnv("MONGODB_DB", "discord_index");

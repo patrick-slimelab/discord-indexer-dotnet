@@ -37,6 +37,8 @@ BIN_SRC="${BIN_SRC:-}"
 # ====== REQUIRED SETTINGS (export before running) ======
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
 DISCORD_GUILD_IDS="${DISCORD_GUILD_IDS:-}"     # optional; if empty, indexer will attempt auto-discovery
+# Gateway intents. Default includes DMs (DIRECT_MESSAGES=4096). For message text, enable MESSAGE_CONTENT (32768) in the Discord Developer Portal.
+DISCORD_INTENTS="${DISCORD_INTENTS:-4609}"
 
 # By default the installer will provision a dedicated mongo:6 container and bind it to 127.0.0.1:$MONGO_PORT.
 # You can disable with INSTALL_MONGO=0 or point at an external Mongo by setting MONGODB_URI explicitly.
@@ -167,6 +169,7 @@ cat >"$tmp_env" <<EOF
 # discord-indexer env (loaded by systemd)
 DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
 DISCORD_GUILD_IDS=${DISCORD_GUILD_IDS}
+DISCORD_INTENTS=${DISCORD_INTENTS}
 MONGODB_URI=${MONGODB_URI}
 MONGODB_DB=${MONGODB_DB}
 
