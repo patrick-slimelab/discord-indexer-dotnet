@@ -214,7 +214,7 @@ if [[ -z "$TOKEN" ]]; then
   if [[ -t 0 ]]; then
     echo "[install] If you have a Clawdbot/OpenClaw config elsewhere, enter its full path now." >&2
     echo "[install] Examples:" >&2
-    echo "  /home/mystery/.clawdbot/clawdbot.json" >&2
+    echo "  /home/<user>/.clawdbot/clawdbot.json" >&2
     echo "  /home/<user>/.openclaw/openclaw.json" >&2
     read -r -p "Config path (or leave blank to paste token): " CFG_PATH_INPUT || true
 

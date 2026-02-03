@@ -4,7 +4,7 @@ set -euo pipefail
 # install-discord-indexer-from-release.sh
 #
 # Installs discord-indexer + discord-indexer-search from the latest GitHub Release.
-# Designed for Ubuntu hosts (e.g. "mystery"). Does NOT require dotnet or docker.
+# Designed for Ubuntu/Linux hosts. Does NOT require dotnet or docker.
 #
 # What it does:
 # - Downloads discord-indexer-linux-x64.tar.gz + .sha256 from a GitHub Release
