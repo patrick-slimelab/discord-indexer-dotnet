@@ -356,11 +356,40 @@ if command -v systemctl >/dev/null 2>&1; then
   chown discord-indexer:discord-indexer /var/log/discord-indexer/discord-indexer.log
   chmod 0644 /var/log/discord-indexer/discord-indexer.log
 
-  cat > /etc/systemd/system/discord-indexer.service <<'UNIT'
+  # If docker is available, manage MongoDB as a docker container via systemd.
+# (This keeps Mongo alive across reboots and avoids host-level mongod installs.)
+if command -v docker >/dev/null 2>&1; then
+  cat > /etc/systemd/system/discord-indexer-mongo.service <<'MONGO_UNIT'
+[Unit]
+Description=discord-indexer MongoDB (docker container)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Create volume (idempotent)
+ExecStartPre=-/usr/bin/docker volume create discord_indexer_mongo
+
+# Create container if missing; otherwise start it
+ExecStart=/bin/sh -lc 'if /usr/bin/docker ps -a --format "{{.Names}}" | grep -qx discord-indexer-mongo; then /usr/bin/docker start discord-indexer-mongo; else /usr/bin/docker run -d --name discord-indexer-mongo -p 127.0.0.1:27017:27017 -v discord_indexer_mongo:/data/db --restart unless-stopped mongo:6; fi'
+ExecStop=-/usr/bin/docker stop discord-indexer-mongo
+
+[Install]
+WantedBy=multi-user.target
+MONGO_UNIT
+fi
+
+cat > /etc/systemd/system/discord-indexer.service <<'UNIT'
 [Unit]
 Description=discord-indexer (Discord -> MongoDB)
 After=network-online.target
 Wants=network-online.target
+
+# If present, bring up the docker-managed MongoDB first
+Wants=discord-indexer-mongo.service
+After=discord-indexer-mongo.service
 
 [Service]
 Type=simple
@@ -379,7 +408,7 @@ RestartSec=2
 StandardOutput=append:/var/log/discord-indexer/discord-indexer.log
 StandardError=append:/var/log/discord-indexer/discord-indexer.log
 
-# Light hardening (don’t break .NET JIT)
+# Light hardening (don't break .NET JIT)
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -391,6 +420,11 @@ WantedBy=multi-user.target
 UNIT
 
   systemctl daemon-reload
+  # Enable mongo unit if it exists
+  if systemctl list-unit-files | grep -q '^discord-indexer-mongo\.service'; then
+    systemctl enable --now discord-indexer-mongo.service || true
+  fi
+
   systemctl enable --now discord-indexer.service || systemctl restart discord-indexer.service || true
   echo "[install] systemd: enabled+started discord-indexer.service"
 else
