@@ -377,7 +377,7 @@ public class Program
         var json = await resp.Content.ReadAsStringAsync();
         var root = JsonDocument.Parse(json).RootElement;
         if (root.ValueKind != JsonValueKind.Array)
-            return (before, false, 0);
+            return (before, false, 0, 1, preDelayMs);
 
         var msgs = root.EnumerateArray().ToList();
         if (msgs.Count == 0)
