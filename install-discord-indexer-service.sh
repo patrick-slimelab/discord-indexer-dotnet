@@ -37,7 +37,15 @@ BIN_SRC="${BIN_SRC:-}"
 # ====== REQUIRED SETTINGS (export before running) ======
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
 DISCORD_GUILD_IDS="${DISCORD_GUILD_IDS:-}"     # optional; if empty, indexer will attempt auto-discovery
-MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017}"
+
+# By default the installer will provision a dedicated mongo:6 container and bind it to 127.0.0.1:$MONGO_PORT.
+# You can disable with INSTALL_MONGO=0 or point at an external Mongo by setting MONGODB_URI explicitly.
+INSTALL_MONGO="${INSTALL_MONGO:-1}"
+MONGO_CONTAINER_NAME="${MONGO_CONTAINER_NAME:-discord-indexer-mongo}"
+MONGO_VOLUME_NAME="${MONGO_VOLUME_NAME:-discord_indexer_mongo}"
+MONGO_PORT="${MONGO_PORT:-27017}"
+
+MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:${MONGO_PORT}}"
 MONGODB_DB="${MONGODB_DB:-discord_index}"
 
 # Optional CLI flags (if/when your indexer supports them)
@@ -55,6 +63,43 @@ die() {
 # ====== checks ======
 [[ -f "$PROJECT_FILE" ]] || die "Could not find project file: $PROJECT_FILE (run from repo root)"
 [[ -n "$DISCORD_BOT_TOKEN" ]] || die "DISCORD_BOT_TOKEN is required (export it before running)."
+
+# ====== ensure mongo (optional) ======
+if [[ "$INSTALL_MONGO" == "1" ]]; then
+  if need_cmd docker; then
+    # If MONGODB_URI was overridden to a non-local URI, don't try to manage mongo.
+    if [[ "$MONGODB_URI" == mongodb://127.0.0.1:* || "$MONGODB_URI" == mongodb://localhost:* ]]; then
+      # Check for port conflicts
+      if ss -ltn 2>/dev/null | awk '{print $4}' | rg -q "(^|:)${MONGO_PORT}$"; then
+        # If the mongo container is already running on that port, this is fine; otherwise it's a conflict.
+        if ! docker ps --format '{{.Names}}' | rg -q "^${MONGO_CONTAINER_NAME}$"; then
+          die "Port ${MONGO_PORT} is already in use. Set MONGO_PORT=27018 (and rerun), or set MONGODB_URI to an external Mongo."
+        fi
+      fi
+
+      # Create volume if missing
+      docker volume inspect "$MONGO_VOLUME_NAME" >/dev/null 2>&1 || docker volume create "$MONGO_VOLUME_NAME" >/dev/null
+
+      # Create/start container if missing
+      if ! docker ps -a --format '{{.Names}}' | rg -q "^${MONGO_CONTAINER_NAME}$"; then
+        echo "[install] Starting dedicated MongoDB container: ${MONGO_CONTAINER_NAME} (127.0.0.1:${MONGO_PORT})"
+        docker run -d \
+          --name "$MONGO_CONTAINER_NAME" \
+          --restart unless-stopped \
+          -p "127.0.0.1:${MONGO_PORT}:27017" \
+          -v "${MONGO_VOLUME_NAME}:/data/db" \
+          mongo:6 >/dev/null
+      else
+        if ! docker ps --format '{{.Names}}' | rg -q "^${MONGO_CONTAINER_NAME}$"; then
+          echo "[install] Starting existing MongoDB container: ${MONGO_CONTAINER_NAME}"
+          docker start "$MONGO_CONTAINER_NAME" >/dev/null
+        fi
+      fi
+    fi
+  else
+    echo "WARN: INSTALL_MONGO=1 but docker is not installed; skipping Mongo container provisioning." >&2
+  fi
+fi
 
 # ====== build ======
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
