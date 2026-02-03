@@ -14,6 +14,7 @@ public class Program
 
     private static IMongoCollection<BsonDocument>? _messages;
     private static IMongoCollection<BsonDocument>? _backfill;
+    private static IMongoCollection<BsonDocument>? _users;
 
     private static int _backfillPageSize = 100; // Discord max
     private static int _backfillWorkers = 2;
@@ -50,6 +51,7 @@ public class Program
         var db = client.GetDatabase(mongoDbName);
         _messages = db.GetCollection<BsonDocument>("messages");
         _backfill = db.GetCollection<BsonDocument>("channel_backfill");
+        _users = db.GetCollection<BsonDocument>("users");
         await EnsureIndexes();
         Console.WriteLine("MongoDB indexes ensured.");
 
@@ -107,7 +109,7 @@ public class Program
 
     private static async Task EnsureIndexes()
     {
-        if (_messages == null || _backfill == null) return;
+        if (_messages == null || _backfill == null || _users == null) return;
 
         await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("message_id"),
@@ -116,12 +118,22 @@ public class Program
         await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("channel_id").Descending("timestamp_ms")));
 
+        await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("author_id").Descending("timestamp_ms")));
+
         await _backfill.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("channel_id"),
             new CreateIndexOptions { Unique = true }));
 
         await _backfill.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("done").Ascending("updated_at")));
+
+        await _users.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("user_id"),
+            new CreateIndexOptions { Unique = true }));
+
+        await _users.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Descending("last_seen_ms")));
     }
 
     private static async Task<string[]> ListGuildIds(string apiBase)
@@ -412,6 +424,16 @@ public class Program
         var timestamp = msg.TryGetProperty("timestamp", out var ts) ? ts.GetString() : null;
         var guildId = msg.TryGetProperty("guild_id", out var gid) ? gid.GetString() : null;
 
+        string? authorId = null;
+        string? authorUsername = null;
+        string? authorGlobalName = null;
+        if (msg.TryGetProperty("author", out var author) && author.ValueKind == JsonValueKind.Object)
+        {
+            authorId = author.TryGetProperty("id", out var aid) ? aid.GetString() : null;
+            authorUsername = author.TryGetProperty("username", out var au) ? au.GetString() : null;
+            authorGlobalName = author.TryGetProperty("global_name", out var agn) ? agn.GetString() : null;
+        }
+
         long tsMs = 0;
         if (!string.IsNullOrEmpty(timestamp) && DateTimeOffset.TryParse(timestamp, out var dto))
             tsMs = dto.ToUnixTimeMilliseconds();
@@ -421,6 +443,7 @@ public class Program
             { "message_id", id },
             { "channel_id", channelId == null ? (BsonValue)BsonNull.Value : new BsonString(channelId) },
             { "guild_id", guildId == null ? (BsonValue)BsonNull.Value : new BsonString(guildId) },
+            { "author_id", authorId == null ? (BsonValue)BsonNull.Value : new BsonString(authorId) },
             { "timestamp", timestamp == null ? (BsonValue)BsonNull.Value : new BsonString(timestamp) },
             { "timestamp_ms", tsMs },
             { "source", source },
@@ -435,6 +458,27 @@ public class Program
         catch (MongoWriteException mwx) when (mwx.WriteError.Category == ServerErrorCategory.DuplicateKey)
         {
             // ignore duplicates
+        }
+
+        // Maintain a small user lookup table for ID -> latest name (helps profiling by user_id)
+        if (_users != null && !string.IsNullOrEmpty(authorId))
+        {
+            var uf = Builders<BsonDocument>.Filter.Eq("user_id", authorId);
+            var uu = Builders<BsonDocument>.Update
+                .Set("user_id", authorId)
+                .Set("username", authorUsername == null ? (BsonValue)BsonNull.Value : new BsonString(authorUsername))
+                .Set("global_name", authorGlobalName == null ? (BsonValue)BsonNull.Value : new BsonString(authorGlobalName))
+                .Set("last_seen_ms", tsMs)
+                .Set("updated_at", DateTime.UtcNow);
+
+            try
+            {
+                await _users.UpdateOneAsync(uf, uu, new UpdateOptions { IsUpsert = true });
+            }
+            catch
+            {
+                // ignore lookup races/errors
+            }
         }
     }
 
