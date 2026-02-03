@@ -162,6 +162,13 @@ sudo install -d -o root -g root -m 0755 "$ENV_DIR"
 echo "[install] Installing binary -> $BIN_DST"
 sudo install -o root -g root -m 0755 "$BIN_SRC" "$BIN_DST"
 
+# ====== install helper CLI ======
+HELPER_SRC="$REPO_DIR/discord-indexer-search"
+if [[ -f "$HELPER_SRC" ]]; then
+  echo "[install] Installing helper -> /usr/local/bin/discord-indexer-search"
+  sudo install -o root -g root -m 0755 "$HELPER_SRC" /usr/local/bin/discord-indexer-search
+fi
+
 # ====== write env file (secrets live here) ======
 echo "[install] Writing env file -> $ENV_FILE"
 tmp_env="$(mktemp)"
