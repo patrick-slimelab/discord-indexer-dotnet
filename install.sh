@@ -148,6 +148,11 @@ install -d "$PREFIX"
 install -m 0755 "$TMP/discord-indexer" "$PREFIX/discord-indexer"
 install -m 0755 "$TMP/discord-indexer-search" "$PREFIX/discord-indexer-search"
 
+# Optional helper (added in newer releases)
+if [[ -f "$TMP/discord-indexer-curl" ]]; then
+  install -m 0755 "$TMP/discord-indexer-curl" "$PREFIX/discord-indexer-curl"
+fi
+
 echo "[install] Installed binaries to $PREFIX"
 
 # --- OpenClaw token detection ---

@@ -4,7 +4,7 @@ Discord → MongoDB indexer with backfill + rate limit coordination.
 
 ## One-line install (Linux)
 
-Installs the **latest GitHub Release** (`discord-indexer` + `discord-indexer-search`) to `/usr/local/bin`.
+Installs the **latest GitHub Release** (`discord-indexer` + helper CLIs) to `/usr/local/bin`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/patrick-slimelab/discord-indexer-dotnet/master/install.sh | sudo bash
@@ -27,7 +27,7 @@ If the installer detects an OpenClaw state dir at one of:
 ## Releases
 
 Releases include:
-- `discord-indexer-linux-x64.tar.gz`
+- `discord-indexer-linux-x64.tar.gz` (contains `discord-indexer`, `discord-indexer-search`, `discord-indexer-curl`)
 - `discord-indexer-linux-x64.sha256`
 
 ## Notes
