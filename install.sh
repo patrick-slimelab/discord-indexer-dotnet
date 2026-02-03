@@ -34,39 +34,18 @@ need() {
 need curl
 need tar
 need sha256sum
-need gpg
-
-# Optional: install mongosh for discord-indexer-search (Debian/Ubuntu)
-if ! command -v mongosh >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "[install] mongosh not found; attempting to install mongosh (Ubuntu/Debian)" >&2
-    export DEBIAN_FRONTEND=noninteractive
-    if ! apt-get install -y mongosh >/dev/null 2>&1; then
-      # Fallback: add MongoDB official repo for mongosh when distro repos don't have it
-      if command -v curl >/dev/null 2>&1; then
-        curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg || true
-        echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(. /etc/os-release && echo ${UBUNTU_CODENAME:-$VERSION_CODENAME})/mongodb-org/6.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-6.0.list || true
-        apt-get update -y >/dev/null || true
-        apt-get install -y mongosh >/dev/null || true
-      fi
-    fi
-  fi
-fi
 
 
 # Ensure we can query the DB locally (used by discord-indexer-search)
 install_mongosh_if_possible() {
   if command -v mongosh >/dev/null 2>&1; then return 0; fi
 
-  # Try apt first (varies by distro)
+  # Try apt (without apt-get update; avoid breaking on bad third-party PPAs)
   if command -v apt-get >/dev/null 2>&1; then
-    echo "[install] mongosh not found; attempting apt-get install mongodb-mongosh" >&2
+    echo "[install] mongosh not found; attempting apt-get install mongosh" >&2
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null || true
-    apt-get install -y mongodb-mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
-
-    echo "[install] apt package mongodb-mongosh not available; attempting apt-get install mongosh" >&2
     apt-get install -y mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
+    apt-get install -y mongodb-mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
   fi
 
   # Fallback: install from MongoDB tarball (no repo setup needed)
@@ -76,7 +55,7 @@ install_mongosh_if_possible() {
   echo "[install] Installing mongosh from tarball: $url" >&2
   local tmp
   tmp="$(mktemp -d)"
-  ( 
+  (
     cd "$tmp"
     curl -fsSL -o mongosh.tgz "$url"
     tar -xzf mongosh.tgz
@@ -134,6 +113,28 @@ curl -fsSL -o "$TMP/$ASSET_SHA" "$BASE_URL/$ASSET_SHA"
 
 # Install mongosh (best-effort)
 install_mongosh_if_possible || echo "[install] NOTE: failed to install mongosh automatically" >&2
+
+# Optional: provision a local MongoDB via Docker (recommended)
+# Set INSTALL_MONGO_DOCKER=0 to skip.
+INSTALL_MONGO_DOCKER="${INSTALL_MONGO_DOCKER:-1}"
+
+provision_mongo_docker_if_possible() {
+  [[ "$INSTALL_MONGO_DOCKER" == "1" ]] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps >/dev/null 2>&1 || return 0
+
+  # If container already exists, do nothing
+  if docker ps -a --format '{{.Names}}' | grep -qx 'discord-indexer-mongo'; then
+    docker start discord-indexer-mongo >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  echo "[install] Provisioning MongoDB via Docker (discord-indexer-mongo on 127.0.0.1:27017)" >&2
+  docker volume create discord_indexer_mongo >/dev/null
+  docker run -d --name discord-indexer-mongo     -p 127.0.0.1:27017:27017     -v discord_indexer_mongo:/data/db     --restart unless-stopped     mongo:6 >/dev/null
+}
+
+provision_mongo_docker_if_possible || true
 
 cd "$TMP"
 
