@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# discord-indexer-curl
+#
+# Lightweight helper to call Discord REST using the bot token used by discord-indexer.
+#
+# Usage:
+#   discord-indexer-curl /channels/<id>
+#   discord-indexer-curl /guilds/<id>/channels
+#   discord-indexer-curl /channels/<id>/messages?limit=5
+#   discord-indexer-curl --method POST /channels/<id>/messages --data '{"content":"hi"}'
+#
+# Notes:
+# - This is for debugging/inspection.
+# - It does NOT coordinate Discord rate limits (unlike the indexer).
+
+API_BASE="${DISCORD_API_BASE:-https://discord.com/api/v10}"
+ENV_FILE="${DISCORD_INDEXER_ENV_FILE:-/etc/discord-indexer/indexer.env}"
+
+METHOD="GET"
+DATA=""
+RAW=0
+
+usage() {
+  cat <<EOF
+Usage: discord-indexer-curl [--method M] [--data JSON] [--raw] <path-or-url>
+
+Examples:
+  discord-indexer-curl /channels/123
+  discord-indexer-curl /channels/123/messages?limit=5
+  discord-indexer-curl --method POST /channels/123/messages --data '{"content":"hi"}'
+
+Token sources (first wins):
+  - DISCORD_BOT_TOKEN env var
+  - DISCORD_BOT_TOKEN in $ENV_FILE
+  - channels.discord.token in ~/.clawdbot/clawdbot.json or ~/.openclaw/openclaw.json (if jq installed)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage; exit 0;;
+    --method)
+      METHOD="$2"; shift 2;;
+    --data)
+      DATA="$2"; shift 2;;
+    --raw)
+      RAW=1; shift;;
+    *)
+      break;;
+  esac
+done
+
+TARGET="${1:-}"
+if [[ -z "$TARGET" ]]; then
+  usage >&2
+  exit 2
+fi
+
+read_token_from_env_file() {
+  [[ -f "$ENV_FILE" ]] || return 1
+  # shellcheck disable=SC1090
+  set -a
+  source "$ENV_FILE" >/dev/null 2>&1 || true
+  set +a
+  [[ -n "${DISCORD_BOT_TOKEN:-}" ]]
+}
+
+read_token_from_openclaw_cfg() {
+  command -v jq >/dev/null 2>&1 || return 1
+  local home
+  home="${HOME:-}"
+  local cfgs=(
+    "$home/.clawdbot/clawdbot.json"
+    "$home/.openclaw/openclaw.json"
+    "$home/.moltbot/openclaw.json"
+  )
+  for cfg in "${cfgs[@]}"; do
+    if [[ -f "$cfg" ]]; then
+      local tok
+      tok="$(jq -r '.channels.discord.token // empty' "$cfg" 2>/dev/null || true)"
+      if [[ -n "$tok" && "$tok" != "null" ]]; then
+        export DISCORD_BOT_TOKEN="$tok"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+if [[ -z "${DISCORD_BOT_TOKEN:-}" ]]; then
+  read_token_from_env_file || true
+fi
+if [[ -z "${DISCORD_BOT_TOKEN:-}" ]]; then
+  read_token_from_openclaw_cfg || true
+fi
+
+if [[ -z "${DISCORD_BOT_TOKEN:-}" ]]; then
+  echo "ERROR: DISCORD_BOT_TOKEN not found (set env var or configure $ENV_FILE)" >&2
+  exit 1
+fi
+
+URL="$TARGET"
+if [[ "$URL" != http*://* ]]; then
+  # ensure leading slash
+  if [[ "$URL" != /* ]]; then URL="/$URL"; fi
+  URL="${API_BASE%/}$URL"
+fi
+
+# Build curl args
+CURL_ARGS=(
+  -sS
+  -H "Authorization: Bot ${DISCORD_BOT_TOKEN}"
+  -H "User-Agent: discord-indexer-curl"
+)
+
+if [[ "$METHOD" != "GET" ]]; then
+  CURL_ARGS+=( -X "$METHOD" )
+fi
+
+if [[ -n "$DATA" ]]; then
+  CURL_ARGS+=( -H "Content-Type: application/json" --data "$DATA" )
+fi
+
+if [[ "$RAW" == "1" ]]; then
+  curl "${CURL_ARGS[@]}" "$URL"
+  exit $?
+fi
+
+# Pretty-print JSON if jq is available
+if command -v jq >/dev/null 2>&1; then
+  curl "${CURL_ARGS[@]}" "$URL" | jq .
+else
+  curl "${CURL_ARGS[@]}" "$URL"
+fi
