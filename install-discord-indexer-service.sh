@@ -161,7 +161,9 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${STATE_DIR} ${LOG_DIR}
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# .NET JIT needs W+X memory; enabling this can crash (SIGSEGV).
+# If you publish NativeAOT / fully AOT, you can re-enable.
+# MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target
