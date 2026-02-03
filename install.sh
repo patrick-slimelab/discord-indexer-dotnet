@@ -35,6 +35,39 @@ need curl
 need tar
 need sha256sum
 
+# Ensure we can query the DB locally (used by discord-indexer-search)
+install_mongosh_if_possible() {
+  if command -v mongosh >/dev/null 2>&1; then return 0; fi
+
+  # Try apt first (varies by distro)
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[install] mongosh not found; attempting apt-get install mongodb-mongosh" >&2
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null || true
+    apt-get install -y mongodb-mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
+
+    echo "[install] apt package mongodb-mongosh not available; attempting apt-get install mongosh" >&2
+    apt-get install -y mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
+  fi
+
+  # Fallback: install from MongoDB tarball (no repo setup needed)
+  local ver="2.3.8"
+  local arch="linux-x64"
+  local url="https://downloads.mongodb.com/compass/mongosh-${ver}-${arch}.tgz"
+  echo "[install] Installing mongosh from tarball: $url" >&2
+  local tmp
+  tmp="$(mktemp -d)"
+  ( 
+    cd "$tmp"
+    curl -fsSL -o mongosh.tgz "$url"
+    tar -xzf mongosh.tgz
+    install -m 0755 mongosh-*/bin/mongosh /usr/local/bin/mongosh
+  )
+  rm -rf "$tmp"
+
+  command -v mongosh >/dev/null 2>&1
+}
+
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "ERROR: run as root (use: curl ... | sudo bash)" >&2
   exit 1
@@ -79,6 +112,9 @@ BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 echo "[install] Downloading ${ASSET_TGZ} (${TAG})"
 curl -fsSL -o "$TMP/$ASSET_TGZ" "$BASE_URL/$ASSET_TGZ"
 curl -fsSL -o "$TMP/$ASSET_SHA" "$BASE_URL/$ASSET_SHA"
+
+# Install mongosh (best-effort)
+install_mongosh_if_possible || echo "[install] NOTE: failed to install mongosh automatically" >&2
 
 cd "$TMP"
 
@@ -295,7 +331,10 @@ if command -v systemctl >/dev/null 2>&1; then
   fi
 
   mkdir -p /var/log/discord-indexer
-  chown discord-indexer:discord-indexer /var/log/discord-indexer
+  touch /var/log/discord-indexer/discord-indexer.log
+  chown discord-indexer:discord-indexer /var/log/discord-indexer /var/log/discord-indexer/discord-indexer.log
+  chmod 0755 /var/log/discord-indexer
+  chmod 0644 /var/log/discord-indexer/discord-indexer.log
 
   cat > /etc/systemd/system/discord-indexer.service <<'UNIT'
 [Unit]
