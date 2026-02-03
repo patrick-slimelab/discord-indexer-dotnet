@@ -17,6 +17,10 @@ REPO="${REPO:-patrick-slimelab/discord-indexer-dotnet}"
 VERSION="${VERSION:-latest}" # latest or vX.Y.Z
 PREFIX="${PREFIX:-/usr/local/bin}"
 
+# Optional override when OpenClaw/Clawdbot config is in a non-standard location:
+#   OPENCLAW_CONFIG_PATH=/path/to/openclaw.json
+OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-}"
+
 ASSET_TGZ="discord-indexer-linux-x64.tar.gz"
 ASSET_SHA="discord-indexer-linux-x64.sha256"
 
@@ -158,11 +162,35 @@ TOKEN=""
 # Ensure jq exists if we can easily install it (Debian/Ubuntu)
 install_jq_if_possible || true
 
-# Try candidates
-for cfg in \
-  "$INVOKER_HOME/.openclaw/openclaw.json" \
-  "$INVOKER_HOME/.moltbot/openclaw.json" \
-  "$INVOKER_HOME/.clawdbot/openclaw.json"; do
+# Try candidates (OpenClaw + Clawdbot)
+# NOTE: clawdbot installs often store config as clawdbot.json (not openclaw.json)
+collect_cfg_candidates() {
+  local home="$1"
+  echo "$home/.openclaw/openclaw.json"
+  echo "$home/.moltbot/openclaw.json"
+  echo "$home/.clawdbot/openclaw.json"
+  echo "$home/.clawdbot/clawdbot.json"
+}
+
+# Explicit override path (if provided)
+if [[ -n "${OPENCLAW_CONFIG_PATH:-}" ]]; then
+  CANDIDATES=("$OPENCLAW_CONFIG_PATH")
+else
+  CANDIDATES=()
+fi
+
+# Try invoking user's home first
+CANDIDATES+=( $(collect_cfg_candidates "$INVOKER_HOME") )
+
+# Also scan other /home/* users for clawdbot installs (common when running from a different shell user)
+if [[ -d /home ]]; then
+  while IFS= read -r d; do
+    CANDIDATES+=("$d/.clawdbot/clawdbot.json")
+    CANDIDATES+=("$d/.openclaw/openclaw.json")
+  done < <(find /home -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+fi
+
+for cfg in "${CANDIDATES[@]}"; do
   if [[ -f "$cfg" ]]; then
     if command -v jq >/dev/null 2>&1; then
       TOKEN="$(jq -r '.channels.discord.token // empty' "$cfg" 2>/dev/null || true)"
@@ -173,13 +201,41 @@ for cfg in \
       fi
     fi
     if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
+      echo "[install] Detected Discord token from: $cfg" >&2
       break
     fi
   fi
 done
 
 if [[ -z "$TOKEN" ]]; then
-  echo "[install] NOTE: could not auto-detect OpenClaw Discord token (config not found or no parser available)" >&2
+  echo "[install] NOTE: could not auto-detect Discord token from OpenClaw/Clawdbot config." >&2
+
+  # Interactive fallback: prompt for path or token
+  if [[ -t 0 ]]; then
+    echo "[install] If you have a Clawdbot/OpenClaw config elsewhere, enter its full path now." >&2
+    echo "[install] Examples:" >&2
+    echo "  /home/mystery/.clawdbot/clawdbot.json" >&2
+    echo "  /home/<user>/.openclaw/openclaw.json" >&2
+    read -r -p "Config path (or leave blank to paste token): " CFG_PATH_INPUT || true
+
+    if [[ -n "${CFG_PATH_INPUT:-}" && -f "$CFG_PATH_INPUT" ]]; then
+      if command -v jq >/dev/null 2>&1; then
+        TOKEN="$(jq -r '.channels.discord.token // empty' "$CFG_PATH_INPUT" 2>/dev/null || true)"
+      else
+        TOKEN="$(extract_token_with_python "$CFG_PATH_INPUT" || true)"
+        if [[ -z "$TOKEN" ]]; then TOKEN="$(extract_token_with_node "$CFG_PATH_INPUT" || true)"; fi
+      fi
+    fi
+
+    if [[ -z "$TOKEN" ]]; then
+      echo "[install] Paste Discord bot token (input hidden)." >&2
+      read -r -s -p "DISCORD_BOT_TOKEN: " TOKEN || true
+      echo >&2
+    fi
+  else
+    echo "[install] Non-interactive shell: set DISCORD_BOT_TOKEN manually in /etc/discord-indexer/indexer.env" >&2
+    echo "[install] Or rerun with: OPENCLAW_CONFIG_PATH=/path/to/openclaw.json curl ... | sudo bash" >&2
+  fi
 fi
 
 # --- Write env file ---
@@ -201,20 +257,29 @@ if [[ ! -f "$ENV_FILE" ]]; then
     echo "INDEXER_BACKFILL_REQUEST_DELAY_MS=\"250\""
     if [[ -n "$TOKEN" ]]; then
       echo "DISCORD_BOT_TOKEN=\"$TOKEN\""
-      echo "# token source: OpenClaw config (channels.discord.token)"
+      echo "# token source: OpenClaw/Clawdbot config (channels.discord.token)"
     else
-      echo "# DISCORD_BOT_TOKEN not set (no OpenClaw config detected)."
+      echo "# DISCORD_BOT_TOKEN not set."
       echo "# Add it here before running the indexer."
     fi
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   echo "[install] Wrote $ENV_FILE (0600)"
 else
-  # If env exists and token is missing, and we detected a token from OpenClaw, patch it in.
-  if [[ -n "$TOKEN" ]] && ! grep -q '^DISCORD_BOT_TOKEN=' "$ENV_FILE"; then
-    echo "[install] Updating existing $ENV_FILE with DISCORD_BOT_TOKEN from OpenClaw (no token printed)"
-    printf '\nDISCORD_BOT_TOKEN="%s"\n# token source: OpenClaw config (channels.discord.token)\n' "$TOKEN" >> "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
+  if [[ -n "$TOKEN" ]]; then
+    if grep -q '^DISCORD_BOT_TOKEN=' "$ENV_FILE"; then
+      echo "[install] Updating existing $ENV_FILE with detected DISCORD_BOT_TOKEN (no token printed)"
+      # Replace the first matching line safely
+      tmpfile="$(mktemp)"
+      awk -v repl="DISCORD_BOT_TOKEN=\"$TOKEN\"" 'BEGIN{done=0} {if(!done && $0 ~ /^DISCORD_BOT_TOKEN=/){print repl; done=1} else {print}} END{if(!done){print repl}}' "$ENV_FILE" > "$tmpfile"
+      cat "$tmpfile" > "$ENV_FILE"
+      rm -f "$tmpfile"
+      chmod 600 "$ENV_FILE"
+    else
+      echo "[install] Adding DISCORD_BOT_TOKEN to existing $ENV_FILE (no token printed)"
+      printf '\nDISCORD_BOT_TOKEN="%s"\n# token source: OpenClaw/Clawdbot config (channels.discord.token)\n' "$TOKEN" >> "$ENV_FILE"
+      chmod 600 "$ENV_FILE"
+    fi
   else
     echo "[install] $ENV_FILE already exists; leaving it unchanged"
   fi
