@@ -34,6 +34,25 @@ need() {
 need curl
 need tar
 need sha256sum
+need gpg
+
+# Optional: install mongosh for discord-indexer-search (Debian/Ubuntu)
+if ! command -v mongosh >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[install] mongosh not found; attempting to install mongosh (Ubuntu/Debian)" >&2
+    export DEBIAN_FRONTEND=noninteractive
+    if ! apt-get install -y mongosh >/dev/null 2>&1; then
+      # Fallback: add MongoDB official repo for mongosh when distro repos don't have it
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg || true
+        echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(. /etc/os-release && echo ${UBUNTU_CODENAME:-$VERSION_CODENAME})/mongodb-org/6.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-6.0.list || true
+        apt-get update -y >/dev/null || true
+        apt-get install -y mongosh >/dev/null || true
+      fi
+    fi
+  fi
+fi
+
 
 # Ensure we can query the DB locally (used by discord-indexer-search)
 install_mongosh_if_possible() {
@@ -331,9 +350,9 @@ if command -v systemctl >/dev/null 2>&1; then
   fi
 
   mkdir -p /var/log/discord-indexer
+  # Allow non-root users to read logs without sudo
   touch /var/log/discord-indexer/discord-indexer.log
-  chown discord-indexer:discord-indexer /var/log/discord-indexer /var/log/discord-indexer/discord-indexer.log
-  chmod 0755 /var/log/discord-indexer
+  chown discord-indexer:discord-indexer /var/log/discord-indexer/discord-indexer.log
   chmod 0644 /var/log/discord-indexer/discord-indexer.log
 
   cat > /etc/systemd/system/discord-indexer.service <<'UNIT'
@@ -347,6 +366,10 @@ Type=simple
 User=discord-indexer
 Group=discord-indexer
 EnvironmentFile=/etc/discord-indexer/indexer.env
+
+# Ensure log file exists and is world-readable
+ExecStartPre=/bin/sh -lc 'mkdir -p /var/log/discord-indexer && touch /var/log/discord-indexer/discord-indexer.log && chown discord-indexer:discord-indexer /var/log/discord-indexer/discord-indexer.log && chmod 0644 /var/log/discord-indexer/discord-indexer.log'
+
 ExecStart=/usr/local/bin/discord-indexer
 Restart=always
 RestartSec=2
