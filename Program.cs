@@ -3,6 +3,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Linq;
+using System.Collections.Concurrent;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -10,7 +11,10 @@ namespace DiscordIndexer;
 
 public class Program
 {
-    private static readonly HttpClient Http = new();
+    internal static readonly HttpClient Http = new();
+
+    // Discord rate-limit coordination (header-driven). Key goal: avoid 429s by serializing per bucket.
+    private static readonly DiscordRateLimiter RateLimiter = new();
 
     private static IMongoCollection<BsonDocument>? _messages;
     private static IMongoCollection<BsonDocument>? _backfill;
@@ -150,7 +154,7 @@ public class Program
             var url = $"{apiBase}/users/@me/guilds?limit=200";
             if (!string.IsNullOrEmpty(after)) url += $"&after={Uri.EscapeDataString(after)}";
 
-            var resp = await Http.GetAsync(url);
+            var resp = await RateLimiter.GetAsync(url, routeKey: "GET:/users/@me/guilds");
             if (!resp.IsSuccessStatusCode)
             {
                 Console.WriteLine($"WARN: Failed to list guilds: {(int)resp.StatusCode} {resp.ReasonPhrase}");
@@ -190,7 +194,7 @@ public class Program
 
         Console.WriteLine($"Fetching channels for guild {guildId}...");
         var url = $"{apiBase}/guilds/{guildId}/channels";
-        var resp = await Http.GetAsync(url);
+        var resp = await RateLimiter.GetAsync(url, routeKey: "GET:/guilds/:guildId/channels");
         if (!resp.IsSuccessStatusCode)
         {
             Console.WriteLine($"WARN: Failed to list channels for guild {guildId}: {(int)resp.StatusCode} {resp.ReasonPhrase}");
@@ -331,7 +335,7 @@ public class Program
         if (!string.IsNullOrEmpty(before))
             url += $"&before={before}";
 
-        var resp = await Http.GetAsync(url);
+        var resp = await RateLimiter.GetAsync(url, routeKey: "GET:/channels/:channelId/messages");
 
         // Rate limiting
         if ((int)resp.StatusCode == 429)
