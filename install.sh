@@ -117,33 +117,69 @@ read_discord_token_from_openclaw() {
 }
 
 TOKEN=""
-# Prefer jq, but fall back to python3 for JSON parsing (common on Linux)
-if command -v jq >/dev/null 2>&1; then
-  TOKEN="$(read_discord_token_from_openclaw "$INVOKER_HOME" || true)"
-else
-  # python3 fallback
-  if command -v python3 >/dev/null 2>&1; then
-    for cfg in \
-      "$INVOKER_HOME/.openclaw/openclaw.json" \
-      "$INVOKER_HOME/.moltbot/openclaw.json" \
-      "$INVOKER_HOME/.clawdbot/openclaw.json"; do
-      if [[ -f "$cfg" ]]; then
-        TOKEN="$(python3 - <<PY 2>/dev/null || true
+# --- OpenClaw token detection ---
+# Prefer jq; otherwise try python3/python/node; if none are present, attempt to install jq (apt).
+
+install_jq_if_possible() {
+  if command -v jq >/dev/null 2>&1; then return 0; fi
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[install] jq not found; attempting apt-get install jq" >&2
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null
+    apt-get install -y jq >/dev/null
+    command -v jq >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+extract_token_with_python() {
+  local cfg="$1"
+  local py=""
+  if command -v python3 >/dev/null 2>&1; then py="python3"; fi
+  if [[ -z "$py" ]] && command -v python >/dev/null 2>&1; then py="python"; fi
+  [[ -n "$py" ]] || return 1
+  "$py" - <<PY 2>/dev/null || true
 import json
 p = r'''$cfg'''
 with open(p,'r',encoding='utf-8') as f:
   data=json.load(f)
 print((data.get('channels',{}) or {}).get('discord',{}).get('token','') or '')
 PY
-)"
-        if [[ -n "$TOKEN" ]]; then
-          break
-        fi
+}
+
+extract_token_with_node() {
+  local cfg="$1"
+  command -v node >/dev/null 2>&1 || return 1
+  node -e 'const fs=require("fs"); const p=process.argv[1]; const d=JSON.parse(fs.readFileSync(p,"utf8")); const t=(((d.channels||{}).discord||{}).token)||""; process.stdout.write(t);' "$cfg" 2>/dev/null || true
+}
+
+TOKEN=""
+
+# Ensure jq exists if we can easily install it (Debian/Ubuntu)
+install_jq_if_possible || true
+
+# Try candidates
+for cfg in \
+  "$INVOKER_HOME/.openclaw/openclaw.json" \
+  "$INVOKER_HOME/.moltbot/openclaw.json" \
+  "$INVOKER_HOME/.clawdbot/openclaw.json"; do
+  if [[ -f "$cfg" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      TOKEN="$(jq -r '.channels.discord.token // empty' "$cfg" 2>/dev/null || true)"
+    else
+      TOKEN="$(extract_token_with_python "$cfg" || true)"
+      if [[ -z "$TOKEN" ]]; then
+        TOKEN="$(extract_token_with_node "$cfg" || true)"
       fi
-    done
-  else
-    echo "[install] NOTE: neither jq nor python3 found; skipping OpenClaw token detection" >&2
+    fi
+    if [[ -n "$TOKEN" && "$TOKEN" != "null" ]]; then
+      break
+    fi
   fi
+done
+
+if [[ -z "$TOKEN" ]]; then
+  echo "[install] NOTE: could not auto-detect OpenClaw Discord token (config not found or no parser available)" >&2
 fi
 
 # --- Write env file ---
@@ -184,11 +220,64 @@ else
   fi
 fi
 
+
+# --- systemd service install ---
+if command -v systemctl >/dev/null 2>&1; then
+  echo "[install] Installing systemd unit (discord-indexer.service)"
+
+  if ! id -u discord-indexer >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin discord-indexer
+  fi
+
+  mkdir -p /var/log/discord-indexer
+  chown discord-indexer:discord-indexer /var/log/discord-indexer
+
+  cat > /etc/systemd/system/discord-indexer.service <<'UNIT'
+[Unit]
+Description=discord-indexer (Discord -> MongoDB)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=discord-indexer
+Group=discord-indexer
+EnvironmentFile=/etc/discord-indexer/indexer.env
+ExecStart=/usr/local/bin/discord-indexer
+Restart=always
+RestartSec=2
+
+# Logging
+StandardOutput=append:/var/log/discord-indexer/discord-indexer.log
+StandardError=append:/var/log/discord-indexer/discord-indexer.log
+
+# Light hardening (don’t break .NET JIT)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/discord-indexer
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now discord-indexer.service || systemctl restart discord-indexer.service || true
+  echo "[install] systemd: enabled+started discord-indexer.service"
+else
+  echo "[install] NOTE: systemctl not found; skipping service installation" >&2
+fi
+
 cat <<EOF
 
-[install] Next steps:
-- Edit $ENV_FILE as needed.
-- Run the indexer:
-    set -a; source $ENV_FILE; set +a; discord-indexer
+[install] Done.
+- Env file: $ENV_FILE
+- Logs: /var/log/discord-indexer/discord-indexer.log
+- Service: discord-indexer.service (systemd)
+
+Check status:
+  systemctl status discord-indexer.service --no-pager
+  tail -n 200 /var/log/discord-indexer/discord-indexer.log
 
 EOF
