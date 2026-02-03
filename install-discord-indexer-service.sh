@@ -79,7 +79,8 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     echo "[install] Building docker image (target=export) ..."
     docker build -t discord-indexer-build:local --target export "$REPO_DIR" >/dev/null
 
-    cid="$(docker create discord-indexer-build:local)"
+    # Image target=export is FROM scratch and has no default CMD; provide one so docker can create the container.
+    cid="$(docker create discord-indexer-build:local /discord-indexer)"
     trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
     echo "[install] Extracting binary from image -> $BIN_SRC"
