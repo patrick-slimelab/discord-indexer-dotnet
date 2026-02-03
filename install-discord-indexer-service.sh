@@ -192,6 +192,10 @@ User=${SVC_USER}
 Group=${SVC_GROUP}
 WorkingDirectory=${STATE_DIR}
 EnvironmentFile=${ENV_FILE}
+Environment=MONGO_PORT=${MONGO_PORT}
+
+# Wait for Mongo to accept TCP connections (avoid crash loops at boot)
+ExecStartPre=/bin/bash -lc 'for i in {1..120}; do (echo >/dev/tcp/127.0.0.1/'"$MONGO_PORT"') >/dev/null 2>&1 && exit 0; sleep 0.5; done; echo "Mongo not ready" >&2; exit 1'
 
 StandardOutput=append:${LOG_DIR}/discord-indexer.log
 StandardError=append:${LOG_DIR}/discord-indexer.err

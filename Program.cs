@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Linq;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -16,6 +17,7 @@ public class Program
 
     private static int _backfillPageSize = 100; // Discord max
     private static int _backfillWorkers = 2;
+    private static int _backfillRequestDelayMs = 500;
 
     public static async Task Main(string[] args)
     {
@@ -32,6 +34,7 @@ public class Program
 
         _backfillPageSize = int.Parse(GetEnv("INDEXER_BACKFILL_PAGE_SIZE", _backfillPageSize.ToString()));
         _backfillWorkers = int.Parse(GetEnv("INDEXER_BACKFILL_WORKERS", _backfillWorkers.ToString()));
+        _backfillRequestDelayMs = int.Parse(GetEnv("INDEXER_BACKFILL_REQUEST_DELAY_MS", _backfillRequestDelayMs.ToString()));
 
         if (_backfillPageSize is < 1 or > 100) _backfillPageSize = 100;
 
@@ -244,11 +247,14 @@ public class Program
                     ? claim["cursor_before"].AsString
                     : null;
 
-                var (newCursor, done, count) = await BackfillOnePage(apiBase, channelId, cursor);
+                var (newCursor, done, count, errorDelta, retryAfterMs) = await BackfillOnePage(apiBase, channelId, cursor);
 
-                await UpdateChannelState(channelId, newCursor, done, 0);
+                await UpdateChannelState(channelId, newCursor, done, errorDelta);
 
-                await Task.Delay(350);
+                // Throttle: honor Retry-After/rate limit headers when present, otherwise use a small steady delay.
+                var delay = retryAfterMs > 0 ? retryAfterMs : _backfillRequestDelayMs;
+                if (delay < 0) delay = 0;
+                await Task.Delay(delay);
             }
             catch (Exception ex)
             {
@@ -301,17 +307,71 @@ public class Program
         await _backfill.UpdateOneAsync(filter, upd);
     }
 
-    private static async Task<(string? newCursor, bool done, int count)> BackfillOnePage(string apiBase, string channelId, string? before)
+    private static async Task<(string? newCursor, bool done, int count, int errorDelta, int retryAfterMs)> BackfillOnePage(string apiBase, string channelId, string? before)
     {
         var url = $"{apiBase}/channels/{channelId}/messages?limit={_backfillPageSize}";
         if (!string.IsNullOrEmpty(before))
             url += $"&before={before}";
 
         var resp = await Http.GetAsync(url);
+
+        // Rate limiting
+        if ((int)resp.StatusCode == 429)
+        {
+            // Discord usually returns Retry-After in seconds (as header), sometimes also in JSON body.
+            var retry = resp.Headers.RetryAfter?.Delta;
+            var retryMs = retry != null ? (int)Math.Ceiling(retry.Value.TotalMilliseconds) : 2000;
+
+            // Try parsing JSON body retry_after (seconds)
+            try
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                var root429 = JsonDocument.Parse(body).RootElement;
+                if (root429.TryGetProperty("retry_after", out var ra) && ra.TryGetDouble(out var secs))
+                {
+                    retryMs = (int)Math.Ceiling(secs * 1000);
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+
+            if (retryMs < 250) retryMs = 250;
+            Console.WriteLine($"WARN: Backfill rate-limited for channel {channelId}: 429. Sleeping {retryMs}ms then retrying.");
+            return (before, false, 0, 1, retryMs);
+        }
+
         if (!resp.IsSuccessStatusCode)
         {
             Console.WriteLine($"WARN: Backfill fetch failed for channel {channelId}: {(int)resp.StatusCode} {resp.ReasonPhrase}");
-            return (before, false, 0);
+            return (before, false, 0, 1, _backfillRequestDelayMs);
+        }
+
+        // If we are about to hit the limit, honor reset-after headers.
+        // Discord headers: X-RateLimit-Remaining, X-RateLimit-Reset-After (seconds)
+        var preDelayMs = 0;
+        try
+        {
+            if (resp.Headers.TryGetValues("X-RateLimit-Remaining", out var remVals))
+            {
+                var remStr = remVals.FirstOrDefault();
+                if (int.TryParse(remStr, out var remaining) && remaining <= 0)
+                {
+                    if (resp.Headers.TryGetValues("X-RateLimit-Reset-After", out var resetVals))
+                    {
+                        var resetStr = resetVals.FirstOrDefault();
+                        if (double.TryParse(resetStr, out var resetAfterSecs))
+                        {
+                            preDelayMs = (int)Math.Ceiling(resetAfterSecs * 1000);
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // ignore header parse issues
         }
 
         var json = await resp.Content.ReadAsStringAsync();
@@ -323,7 +383,7 @@ public class Program
         if (msgs.Count == 0)
         {
             Console.WriteLine($"Backfill done for channel {channelId}");
-            return (before, true, 0);
+            return (before, true, 0, 0, preDelayMs);
         }
 
         var oldest = msgs.Last().GetProperty("id").GetString();
@@ -334,7 +394,7 @@ public class Program
         }
 
         Console.WriteLine($"Backfilled {msgs.Count} messages from channel {channelId}");
-        return (oldest, false, msgs.Count);
+        return (oldest, false, msgs.Count, 0, preDelayMs);
     }
 
     private static async Task InsertMessage(JsonElement msg, string source)
