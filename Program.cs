@@ -287,8 +287,10 @@ public class Program
 
         var filter = Builders<BsonDocument>.Filter.Eq("channel_id", channelId);
 
+        var cursorVal = newCursor == null ? (BsonValue)BsonNull.Value : new BsonString(newCursor);
+
         var upd = Builders<BsonDocument>.Update
-            .Set("cursor_before", newCursor == null ? BsonNull.Value : newCursor)
+            .Set<BsonValue>("cursor_before", cursorVal)
             .Set("done", done)
             .Set("claimed", false)
             .Set("updated_at", DateTime.UtcNow);
@@ -351,9 +353,9 @@ public class Program
         var doc = new BsonDocument
         {
             { "message_id", id },
-            { "channel_id", channelId ?? BsonNull.Value },
-            { "guild_id", guildId ?? BsonNull.Value },
-            { "timestamp", timestamp ?? BsonNull.Value },
+            { "channel_id", channelId == null ? (BsonValue)BsonNull.Value : new BsonString(channelId) },
+            { "guild_id", guildId == null ? (BsonValue)BsonNull.Value : new BsonString(guildId) },
+            { "timestamp", timestamp == null ? (BsonValue)BsonNull.Value : new BsonString(timestamp) },
             { "timestamp_ms", tsMs },
             { "source", source },
             { "raw", BsonDocument.Parse(msg.GetRawText()) },
