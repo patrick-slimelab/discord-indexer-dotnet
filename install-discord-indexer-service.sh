@@ -2,7 +2,11 @@
 set -euo pipefail
 
 # One-step installer for discord-indexer (systemd service on Ubuntu).
-# - Builds the binary (dotnet publish) if needed
+#
+# What it does:
+# - Builds the binary automatically:
+#     - prefers local dotnet SDK if present
+#     - otherwise uses Docker (build stage) if available
 # - Installs binary to /usr/local/bin/discord-indexer
 # - Writes secrets to /etc/discord-indexer/indexer.env (0600 root:root)
 # - Installs + starts systemd unit discord-indexer.service
@@ -27,63 +31,67 @@ ENV_FILE="${ENV_FILE:-$ENV_DIR/indexer.env}"
 
 UNIT_NAME="${UNIT_NAME:-discord-indexer.service}"
 
+# If you want to skip building entirely, set BIN_SRC and SKIP_BUILD=1.
+BIN_SRC="${BIN_SRC:-}"
+
 # ====== REQUIRED SETTINGS (export before running) ======
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
-DISCORD_GUILD_IDS="${DISCORD_GUILD_IDS:-}"     # comma-separated guild IDs; empty disables backfill
+DISCORD_GUILD_IDS="${DISCORD_GUILD_IDS:-}"     # optional; if empty, indexer will attempt auto-discovery
 MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017}"
 MONGODB_DB="${MONGODB_DB:-discord_index}"
 
 # Optional CLI flags (if/when your indexer supports them)
 INDEXER_OPTS="${INDEXER_OPTS:-}"
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "ERROR: Missing required command: $1" >&2
-    return 1
-  }
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
 }
 
 # ====== checks ======
-if [[ ! -f "$PROJECT_FILE" ]]; then
-  echo "ERROR: Could not find project file: $PROJECT_FILE" >&2
-  echo "Run this from the repo root (where discord-indexer.csproj is), or set PROJECT_FILE=..." >&2
-  exit 1
-fi
+[[ -f "$PROJECT_FILE" ]] || die "Could not find project file: $PROJECT_FILE (run from repo root)"
+[[ -n "$DISCORD_BOT_TOKEN" ]] || die "DISCORD_BOT_TOKEN is required (export it before running)."
 
-if [[ -z "$DISCORD_BOT_TOKEN" ]]; then
-  echo "ERROR: DISCORD_BOT_TOKEN is required (export it before running)." >&2
-  exit 1
-fi
-
-# ====== build (self-contained single-file) ======
-# We build unconditionally unless SKIP_BUILD=1, because it keeps this "one step".
+# ====== build ======
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-  if ! command -v dotnet >/dev/null 2>&1; then
-    echo "ERROR: dotnet SDK is not installed on this machine, so I can't build the binary." >&2
-    echo "Install .NET 8 SDK (Ubuntu): https://learn.microsoft.com/dotnet/core/install/linux-ubuntu" >&2
-    echo "Then rerun, or set BIN_SRC=/path/to/prebuilt/discord-indexer and SKIP_BUILD=1." >&2
-    exit 1
+  if [[ -z "$BIN_SRC" ]]; then
+    BIN_SRC="$PUBLISH_DIR/discord-indexer"
   fi
 
-  echo "[install] Building discord-indexer ($CONFIGURATION, $RUNTIME) -> $PUBLISH_DIR"
-  rm -rf "$PUBLISH_DIR"
-  mkdir -p "$PUBLISH_DIR"
+  rm -rf "$PUBLISH_DIR" && mkdir -p "$PUBLISH_DIR"
 
-  dotnet publish "$PROJECT_FILE" \
-    -c "$CONFIGURATION" \
-    -r "$RUNTIME" \
-    -o "$PUBLISH_DIR" \
-    --self-contained true \
-    -p:PublishSingleFile=true \
-    -p:PublishTrimmed=false
+  if need_cmd dotnet; then
+    echo "[install] Building with local dotnet SDK -> $PUBLISH_DIR"
+    dotnet publish "$PROJECT_FILE" \
+      -c "$CONFIGURATION" \
+      -r "$RUNTIME" \
+      -o "$PUBLISH_DIR" \
+      --self-contained true \
+      -p:PublishSingleFile=true \
+      -p:PublishTrimmed=false
+  elif need_cmd docker; then
+    # Docker build fallback: uses repo Dockerfile build stage.
+    echo "[install] dotnet not found; building via Docker"
+    echo "[install] Building docker image (target=export) ..."
+    docker build -t discord-indexer-build:local --target export "$REPO_DIR" >/dev/null
+
+    cid="$(docker create discord-indexer-build:local)"
+    trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+    echo "[install] Extracting binary from image -> $BIN_SRC"
+    docker cp "$cid:/discord-indexer" "$BIN_SRC"
+    chmod +x "$BIN_SRC"
+  else
+    die "Neither dotnet SDK nor docker is installed, so I can't build the binary. Install dotnet-sdk-8.0 or docker, or set BIN_SRC=/path/to/prebuilt/discord-indexer and SKIP_BUILD=1."
+  fi
 fi
 
-BIN_SRC="${BIN_SRC:-$PUBLISH_DIR/discord-indexer}"
-if [[ ! -f "$BIN_SRC" ]]; then
-  echo "ERROR: Built binary not found at: $BIN_SRC" >&2
-  echo "If you built to a different output, set BIN_SRC=/path/to/discord-indexer" >&2
-  exit 1
-fi
+[[ -n "$BIN_SRC" ]] || die "BIN_SRC is empty (set BIN_SRC or allow the script to build)."
+[[ -f "$BIN_SRC" ]] || die "Binary not found at BIN_SRC=$BIN_SRC"
 
 # ====== create user/group ======
 if ! getent group "$SVC_GROUP" >/dev/null; then
@@ -146,7 +154,6 @@ ExecStart=${BIN_DST} \$INDEXER_OPTS
 Restart=always
 RestartSec=2
 
-# Hardening (safe defaults; relax if needed)
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
