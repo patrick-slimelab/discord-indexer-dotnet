@@ -19,6 +19,10 @@ public class Program
     private static IMongoCollection<BsonDocument>? _messages;
     private static IMongoCollection<BsonDocument>? _backfill;
     private static IMongoCollection<BsonDocument>? _users;
+    private static IMongoCollection<BsonDocument>? _channels;
+
+    // In-memory channel cache: channel_id -> (guild_id, last_seen_ms)
+    private static readonly ConcurrentDictionary<string, (string? guildId, long lastSeenMs)> ChannelCache = new();
 
     private static int _backfillPageSize = 100; // Discord max
     private static int _backfillWorkers = 2;
@@ -56,6 +60,7 @@ public class Program
         _messages = db.GetCollection<BsonDocument>("messages");
         _backfill = db.GetCollection<BsonDocument>("channel_backfill");
         _users = db.GetCollection<BsonDocument>("users");
+        _channels = db.GetCollection<BsonDocument>("channels");
         await EnsureIndexes();
         Console.WriteLine("MongoDB indexes ensured.");
 
@@ -113,7 +118,7 @@ public class Program
 
     private static async Task EnsureIndexes()
     {
-        if (_messages == null || _backfill == null || _users == null) return;
+        if (_messages == null || _backfill == null || _users == null || _channels == null) return;
 
         await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("message_id"),
@@ -137,6 +142,16 @@ public class Program
             new CreateIndexOptions { Unique = true }));
 
         await _users.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Descending("last_seen_ms")));
+
+        await _channels.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("channel_id"),
+            new CreateIndexOptions { Unique = true }));
+
+        await _channels.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("guild_id").Ascending("channel_id")));
+
+        await _channels.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Descending("last_seen_ms")));
     }
 
@@ -213,6 +228,10 @@ public class Program
 
             var channelId = ch.GetProperty("id").GetString();
             if (string.IsNullOrEmpty(channelId)) continue;
+
+            // Keep a lookup of channel_id -> metadata (name/type/parent) for later analysis.
+            // This also helps fill guild_id when Discord message payloads omit it.
+            await UpsertChannelFromGuildList(ch, guildId);
 
             await SeedBackfillChannel(channelId!, guildId);
         }
@@ -442,6 +461,18 @@ public class Program
         if (!string.IsNullOrEmpty(timestamp) && DateTimeOffset.TryParse(timestamp, out var dto))
             tsMs = dto.ToUnixTimeMilliseconds();
 
+        // Discord REST backfill payloads often omit guild_id. Fill it from the channels/backfill collections.
+        if (string.IsNullOrEmpty(guildId) && !string.IsNullOrEmpty(channelId))
+        {
+            guildId = await GetGuildIdForChannel(channelId!);
+        }
+
+        // Touch channel lookup (helps map channel_id -> guild_id/name over time)
+        if (!string.IsNullOrEmpty(channelId))
+        {
+            await TouchChannel(channelId!, guildId, tsMs);
+        }
+
         var doc = new BsonDocument
         {
             { "message_id", id },
@@ -484,6 +515,118 @@ public class Program
                 // ignore lookup races/errors
             }
         }
+    }
+
+
+    private static async Task UpsertChannelFromGuildList(JsonElement ch, string guildId)
+    {
+        if (_channels == null) return;
+
+        var channelId = ch.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+        if (string.IsNullOrEmpty(channelId)) return;
+
+        var type = ch.TryGetProperty("type", out var tEl) && tEl.TryGetInt32(out var tv) ? tv : (int?)null;
+        var name = ch.TryGetProperty("name", out var nEl) ? nEl.GetString() : null;
+        var parentId = ch.TryGetProperty("parent_id", out var pEl) ? pEl.GetString() : null;
+        var nsfw = ch.TryGetProperty("nsfw", out var nsEl) && nsEl.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? nsEl.GetBoolean()
+            : (bool?)null;
+
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var f = Builders<BsonDocument>.Filter.Eq("channel_id", channelId);
+        var u = Builders<BsonDocument>.Update
+            .Set("channel_id", channelId)
+            .Set("guild_id", guildId)
+            .Set("type", type == null ? (BsonValue)BsonNull.Value : new BsonInt32(type.Value))
+            .Set("name", name == null ? (BsonValue)BsonNull.Value : new BsonString(name))
+            .Set("parent_id", parentId == null ? (BsonValue)BsonNull.Value : new BsonString(parentId))
+            .Set("nsfw", nsfw == null ? (BsonValue)BsonNull.Value : new BsonBoolean(nsfw.Value))
+            .Max("last_seen_ms", nowMs)
+            .Set("updated_at", DateTime.UtcNow);
+
+        try
+        {
+            await _channels.UpdateOneAsync(f, u, new UpdateOptions { IsUpsert = true });
+            ChannelCache[channelId] = (guildId, nowMs);
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    private static async Task TouchChannel(string channelId, string? guildId, long tsMs)
+    {
+        if (_channels == null) return;
+
+        // Use in-memory cache as a cheap guard.
+        if (ChannelCache.TryGetValue(channelId, out var existing) && existing.lastSeenMs >= tsMs && (guildId == null || existing.guildId == guildId))
+            return;
+
+        var f = Builders<BsonDocument>.Filter.Eq("channel_id", channelId);
+        var u = Builders<BsonDocument>.Update
+            .Set("channel_id", channelId)
+            .Set("guild_id", guildId == null ? (BsonValue)BsonNull.Value : new BsonString(guildId))
+            .Max("last_seen_ms", tsMs)
+            .Set("updated_at", DateTime.UtcNow);
+
+        try
+        {
+            await _channels.UpdateOneAsync(f, u, new UpdateOptions { IsUpsert = true });
+            ChannelCache[channelId] = (guildId, tsMs);
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    private static async Task<string?> GetGuildIdForChannel(string channelId)
+    {
+        // Fast path: in-memory cache
+        if (ChannelCache.TryGetValue(channelId, out var cached) && !string.IsNullOrEmpty(cached.guildId))
+            return cached.guildId;
+
+        // Mongo lookup: channels collection
+        if (_channels != null)
+        {
+            try
+            {
+                var doc = await _channels.Find(Builders<BsonDocument>.Filter.Eq("channel_id", channelId)).FirstOrDefaultAsync();
+                if (doc != null && doc.TryGetValue("guild_id", out var gidVal) && gidVal.IsString)
+                {
+                    var gid = gidVal.AsString;
+                    ChannelCache[channelId] = (gid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    return gid;
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        // Fallback: backfill state has guild_id for seeded channels
+        if (_backfill != null)
+        {
+            try
+            {
+                var bf = await _backfill.Find(Builders<BsonDocument>.Filter.Eq("channel_id", channelId)).FirstOrDefaultAsync();
+                if (bf != null && bf.TryGetValue("guild_id", out var bg) && bg.IsString)
+                {
+                    var gid = bg.AsString;
+                    ChannelCache[channelId] = (gid, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    return gid;
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        return null;
     }
 
     private static async Task RunGatewayLoop(string gatewayUrl, string token, int intents)
