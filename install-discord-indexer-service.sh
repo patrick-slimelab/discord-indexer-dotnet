@@ -169,6 +169,12 @@ if [[ -f "$HELPER_SRC" ]]; then
   sudo install -o root -g root -m 0755 "$HELPER_SRC" /usr/local/bin/discord-indexer-search
 fi
 
+DELTA_HELPER_SRC="$REPO_DIR/discord-indexer-delta"
+if [[ -f "$DELTA_HELPER_SRC" ]]; then
+  echo "[install] Installing helper -> /usr/local/bin/discord-indexer-delta"
+  sudo install -o root -g root -m 0755 "$DELTA_HELPER_SRC" /usr/local/bin/discord-indexer-delta
+fi
+
 # ====== write env file (secrets live here) ======
 echo "[install] Writing env file -> $ENV_FILE"
 tmp_env="$(mktemp)"
