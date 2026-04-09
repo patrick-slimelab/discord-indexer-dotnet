@@ -130,6 +130,12 @@ public class Program
         await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("author_id").Descending("timestamp_ms")));
 
+        await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Descending("timestamp_ms")));
+
+        await _messages.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending("guild_id").Descending("timestamp_ms")));
+
         await _backfill.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
             Builders<BsonDocument>.IndexKeys.Ascending("channel_id"),
             new CreateIndexOptions { Unique = true }));

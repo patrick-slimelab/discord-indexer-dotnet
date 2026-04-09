@@ -1,14 +1,15 @@
 ---
 name: discord-indexer
-description: Search and inspect a local Discord message index backed by MongoDB using the repository's discord-indexer-search helper. Use when a user asks to find prior Discord messages, test whether indexing works, look up mentions of a person, phrase, or topic, inspect results by channel or time, or troubleshoot whether a Discord archive/index contains expected content.
+description: Search and inspect a local Discord message index backed by MongoDB using the repository's discord-indexer-search and discord-indexer-delta helpers. Use when a user asks to find prior Discord messages, retrieve server-wide deltas since a timestamp, test whether indexing works, look up mentions of a person, phrase, or topic, inspect results by channel or time, or troubleshoot whether a Discord archive/index contains expected content.
 ---
 
 # Discord Indexer
 
-Use the local helper script from the repository root:
+Use the local helper scripts from the repository root:
 
 ```bash
 ./discord-indexer-search <query>
+./discord-indexer-delta --since 2026-04-09T00:00:00Z
 ```
 
 ## Workflow
@@ -16,12 +17,13 @@ Use the local helper script from the repository root:
 1. Run searches from the repo root so the helper script is available.
 2. Start with a narrow literal query when possible: a name, exact phrase, channel idea, or identifier.
 3. If the first query is noisy, refine with more distinctive terms instead of repeating the same broad search.
-4. Return a short summary plus a few representative hits with timestamp, guild/channel ids, author, and message excerpt.
-5. If a search fails, check whether the indexer service and MongoDB are running before assuming the data is missing.
+4. For server-wide or channel-wide delta retrieval, prefer `./discord-indexer-delta --since ...` instead of trying to fake it with keyword search.
+5. Return a short summary plus a few representative hits with timestamp, guild/channel ids, author, and message excerpt.
+6. If a search fails, check whether the indexer service and MongoDB are running before assuming the data is missing.
 
 ## Output handling
 
-The helper prints tab-separated rows in this shape:
+The helpers print tab-separated rows in this shape (with `discord-indexer-delta` also adding channel name):
 
 - ISO timestamp
 - guild id

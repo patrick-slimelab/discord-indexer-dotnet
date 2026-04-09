@@ -3,7 +3,7 @@ set -euo pipefail
 
 # install-discord-indexer-from-release.sh
 #
-# Installs discord-indexer + discord-indexer-search from the latest GitHub Release.
+# Installs discord-indexer + helper CLIs from the latest GitHub Release.
 # Designed for Ubuntu/Linux hosts. Does NOT require dotnet or docker.
 #
 # What it does:
@@ -76,10 +76,12 @@ sha256sum -c "$ASSET_SHA"
 
 install -m 0755 "$TMP/discord-indexer" /usr/local/bin/discord-indexer
 install -m 0755 "$TMP/discord-indexer-search" /usr/local/bin/discord-indexer-search
+install -m 0755 "$TMP/discord-indexer-delta" /usr/local/bin/discord-indexer-delta
 
 echo "[install] Installed:" \
   "/usr/local/bin/discord-indexer" \
-  "/usr/local/bin/discord-indexer-search"
+  "/usr/local/bin/discord-indexer-search" \
+  "/usr/local/bin/discord-indexer-delta"
 
 if [[ "$INSTALL_SYSTEMD" == "1" ]]; then
   echo "[install] Installing/updating systemd service + env file (via existing installer)"

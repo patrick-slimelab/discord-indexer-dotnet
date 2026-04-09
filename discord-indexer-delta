@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Retrieve discord-indexer MongoDB messages since a timestamp, optionally scoped to a guild/channel.
+#
+# Examples:
+#   discord-indexer-delta --since 2026-04-09T00:00:00Z
+#   discord-indexer-delta --since '2026-04-09 00:00 UTC' --guild 1466068838440370258 --limit 200
+#   discord-indexer-delta --since 1712624400000 --format tsv
+#
+# Env (optional):
+#   MONGODB_URI=mongodb://127.0.0.1:27017
+#   MONGODB_DB=discord_index
+#   MONGO_CONTAINER_NAME=discord-indexer-mongo
+
+usage() {
+  cat <<EOF
+Usage: discord-indexer-delta --since <timestamp|epoch_ms> [--guild GUILD_ID] [--channel CHANNEL_ID] [--limit N] [--format tsv|jsonl]
+
+Retrieves indexed Discord messages at or after --since across all indexed/readable channels by default.
+Optional filters:
+  --guild     Restrict to one guild/server id
+  --channel   Restrict to one channel id
+  --limit     Max rows to return (default: 200)
+  --format    Output format: tsv (default) or jsonl
+
+Notes:
+  - "All channels" means channels the bot could index/read; private or forbidden channels will be absent.
+  - --since accepts ISO-8601-ish timestamps or epoch milliseconds.
+EOF
+}
+
+SINCE=""
+LIMIT=200
+GUILD=""
+CHANNEL=""
+FORMAT="tsv"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --since)
+      SINCE="${2:-}"; shift 2 ;;
+    --guild)
+      GUILD="${2:-}"; shift 2 ;;
+    --channel)
+      CHANNEL="${2:-}"; shift 2 ;;
+    --limit)
+      LIMIT="${2:-}"; shift 2 ;;
+    --format)
+      FORMAT="${2:-}"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage >&2
+      exit 2 ;;
+  esac
+done
+
+if [[ -z "$SINCE" ]]; then
+  echo "ERROR: --since is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --limit must be an integer" >&2
+  exit 2
+fi
+
+case "$FORMAT" in
+  tsv|jsonl) ;;
+  *)
+    echo "ERROR: --format must be tsv or jsonl" >&2
+    exit 2 ;;
+esac
+
+MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017}"
+MONGODB_DB="${MONGODB_DB:-discord_index}"
+MONGO_CONTAINER_NAME="${MONGO_CONTAINER_NAME:-discord-indexer-mongo}"
+
+SINCE_ESCAPED="${SINCE//\\/\\\\}"
+SINCE_ESCAPED="${SINCE_ESCAPED//\"/\\\"}"
+GUILD_ESCAPED="${GUILD//\"/\\\"}"
+CHANNEL_ESCAPED="${CHANNEL//\"/\\\"}"
+
+read -r -d '' JS <<EOF || true
+const dbname = "$MONGODB_DB";
+const sinceRaw = "$SINCE_ESCAPED";
+const guildId = "$GUILD_ESCAPED";
+const channelId = "$CHANNEL_ESCAPED";
+const limit = $LIMIT;
+const format = "$FORMAT";
+
+function parseSince(v) {
+  if (!v) throw new Error("--since is required");
+  if (/^\\d{11,}$/.test(v)) return Number(v);
+  const ms = Date.parse(v);
+  if (!Number.isFinite(ms)) throw new Error(`Invalid --since timestamp: ${v}`);
+  return ms;
+}
+
+const sinceMs = parseSince(sinceRaw);
+const msgCol = db.getSiblingDB(dbname).getCollection('messages');
+const chCol = db.getSiblingDB(dbname).getCollection('channels');
+
+const filter = { timestamp_ms: { \$gte: sinceMs } };
+if (guildId) filter.guild_id = guildId;
+if (channelId) filter.channel_id = channelId;
+
+const channelDocs = chCol.find({}, { channel_id: 1, name: 1, guild_id: 1, parent_id: 1 }).toArray();
+const channelMap = {};
+for (const ch of channelDocs) {
+  if (ch && ch.channel_id) channelMap[ch.channel_id] = ch;
+}
+
+const cursor = msgCol.find(
+  filter,
+  {
+    message_id: 1,
+    guild_id: 1,
+    channel_id: 1,
+    timestamp: 1,
+    timestamp_ms: 1,
+    'raw.author.username': 1,
+    'raw.author.global_name': 1,
+    'raw.content': 1
+  }
+).sort({ timestamp_ms: 1, _id: 1 }).limit(limit);
+
+cursor.forEach(d => {
+  const who = (d.raw && d.raw.author) ? (d.raw.author.global_name || d.raw.author.username || '') : '';
+  const content = (d.raw && d.raw.content) ? d.raw.content : '';
+  const channel = d.channel_id ? (channelMap[d.channel_id] || null) : null;
+  const row = {
+    timestamp: d.timestamp || '',
+    timestamp_ms: d.timestamp_ms || 0,
+    guild_id: d.guild_id || '',
+    channel_id: d.channel_id || '',
+    channel_name: channel && channel.name ? channel.name : '',
+    author: who,
+    content
+  };
+
+  if (format === 'jsonl') {
+    print(JSON.stringify(row));
+  } else {
+    print([
+      row.timestamp,
+      row.guild_id,
+      row.channel_id,
+      row.channel_name,
+      row.author,
+      row.content
+    ].join('\t'));
+  }
+});
+EOF
+
+docker_cmd() {
+  if command -v docker >/dev/null 2>&1; then
+    if docker ps >/dev/null 2>&1; then
+      echo "docker"
+      return
+    fi
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n docker ps >/dev/null 2>&1; then
+    echo "sudo -n docker"
+    return
+  fi
+  echo ""
+}
+
+run_mongosh() {
+  if command -v mongosh >/dev/null 2>&1; then
+    mongosh "$MONGODB_URI" --quiet --eval "$JS"
+    return
+  fi
+
+  DCMD="$(docker_cmd)"
+  if [[ -n "$DCMD" ]]; then
+    if $DCMD ps --format '{{.Names}}' | grep -qx "${MONGO_CONTAINER_NAME}"; then
+      $DCMD exec -i "$MONGO_CONTAINER_NAME" mongosh "$MONGODB_URI" --quiet --eval "$JS"
+      return
+    fi
+  fi
+
+  echo "ERROR: mongosh not found and mongo container '$MONGO_CONTAINER_NAME' not accessible." >&2
+  echo "Install mongosh, or run with sudo, or set MONGO_CONTAINER_NAME to the running container." >&2
+  exit 1
+}
+
+run_mongosh

@@ -10,6 +10,7 @@ set -euo pipefail
 # - Installs:
 #     /usr/local/bin/discord-indexer
 #     /usr/local/bin/discord-indexer-search
+#     /usr/local/bin/discord-indexer-delta
 # - If an OpenClaw config is found, reads channels.discord.token and writes
 #   /etc/discord-indexer/indexer.env (0600) without printing the token.
 
@@ -36,7 +37,7 @@ need tar
 need sha256sum
 
 
-# Ensure we can query the DB locally (used by discord-indexer-search)
+# Ensure we can query the DB locally (used by discord-indexer-search / discord-indexer-delta)
 install_mongosh_if_possible() {
   if command -v mongosh >/dev/null 2>&1; then return 0; fi
 
@@ -147,6 +148,7 @@ sha256sum -c "$ASSET_SHA"
 install -d "$PREFIX"
 install -m 0755 "$TMP/discord-indexer" "$PREFIX/discord-indexer"
 install -m 0755 "$TMP/discord-indexer-search" "$PREFIX/discord-indexer-search"
+install -m 0755 "$TMP/discord-indexer-delta" "$PREFIX/discord-indexer-delta"
 
 echo "[install] Installed binaries to $PREFIX"
 
