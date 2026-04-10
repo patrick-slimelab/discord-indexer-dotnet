@@ -12,14 +12,17 @@ Use the local helper scripts from the repository root:
 ./discord-indexer-delta --since 2026-04-09T00:00:00Z
 ```
 
+Agent note: when you need delta retrieval, prefer the checked-in executable wrapper (`./discord-indexer-delta`) or the installed `discord-indexer-delta` binary, and do not assume an unverified Python path like `discord_indexer_delta.py`. This is guidance for the agent’s own command choice, not a restriction on what a human user may choose to run.
+
 ## Workflow
 
 1. Run searches from the repo root so the helper script is available.
 2. Start with a narrow literal query when possible: a name, exact phrase, channel idea, or identifier.
 3. If the first query is noisy, refine with more distinctive terms instead of repeating the same broad search.
 4. For server-wide or channel-wide delta retrieval, prefer `./discord-indexer-delta --since ...` instead of trying to fake it with keyword search.
-5. Return a short summary plus a few representative hits with timestamp, guild/channel ids, author, and message excerpt.
-6. If a search fails, check whether the indexer service and MongoDB are running before assuming the data is missing.
+5. If a delta call fails, verify the helper path first (`./discord-indexer-delta --help` from repo root, or `discord-indexer-delta --help` if installed) before assuming the index or service is broken.
+6. Return a short summary plus a few representative hits with timestamp, guild/channel ids, author, and message excerpt.
+7. If a search still fails after the helper-path check, check whether the indexer service and MongoDB are running before assuming the data is missing.
 
 ## Output handling
 

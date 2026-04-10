@@ -6,7 +6,9 @@ Query the local MongoDB-backed Discord index from the repository checkout.
 
 ## Expected execution context
 
-Run from the repository root containing `discord-indexer-search`.
+Run from the repository root containing `discord-indexer-search` and `discord-indexer-delta`.
+
+Agent note: do not assume there is a sibling Python entrypoint for delta retrieval unless you have actually verified one exists. Prefer the executable wrapper in the repo (`./discord-indexer-delta`) or the installed binary (`discord-indexer-delta`) when choosing your own command.
 
 ## Typical usage
 
