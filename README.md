@@ -2,6 +2,35 @@
 
 Discord → MongoDB indexer with backfill + rate limit coordination.
 
+## OpenClaw Skill
+
+This repo includes an OpenClaw skill for searching indexed Discord messages.
+
+### Install Skill (One-liner)
+
+```bash
+rm -rf ~/.openclaw/skills/discord-indexer && mkdir -p ~/.openclaw/skills && git clone --depth 1 https://github.com/patrick-slimelab/discord-indexer-dotnet /tmp/discord-indexer && mv /tmp/discord-indexer/skill/discord-indexer ~/.openclaw/skills/ && rm -rf /tmp/discord-indexer
+```
+
+### Alternative: Use extraDirs (no install needed)
+
+Add to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "skills": {
+    "load": {
+      "extraDirs": ["~/discord-indexer-dotnet/skill"]
+    }
+  }
+}
+```
+
+Then clone the repo:
+```bash
+git clone https://github.com/patrick-slimelab/discord-indexer-dotnet ~/discord-indexer-dotnet
+```
+
 ## One-line install (Linux)
 
 Installs the **latest GitHub Release** (`discord-indexer`, `discord-indexer-search`, and `discord-indexer-delta`) to `/usr/local/bin`.
